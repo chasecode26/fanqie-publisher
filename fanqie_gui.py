@@ -31,6 +31,7 @@ try:
         save_draft, publish_scheduled, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
         reschedule_on_manage_page, detect_volumes, select_volume,
+        select_editor_volume, resolve_new_chapter_volume,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
         BOOKS_JS, LAST_PUBLISH_JS,
@@ -247,6 +248,62 @@ class FanqieGUI:
             frm, text="章节管理 ↗", command=self._open_chapter_manage)
         self.btn_open_manage.pack(side="left", padx=(0, 6), pady=4)
 
+        # --- 3. 工作流预设 ---
+        frm_preset = ttk.LabelFrame(self.root, text="工作流预设")
+        frm_preset.pack(fill="x", **pad)
+
+        row_preset1 = ttk.Frame(frm_preset)
+        row_preset1.pack(fill="x", padx=6, pady=4)
+        ttk.Label(row_preset1, text="默认书号:").pack(side="left")
+        self.preferred_book_id_var = tk.StringVar(
+            value=str(self._cfg.get("preferred_book_id", "") or "")
+        )
+        self.ent_preferred_book_id = ttk.Entry(
+            row_preset1, textvariable=self.preferred_book_id_var, width=22
+        )
+        self.ent_preferred_book_id.pack(side="left", padx=4)
+        self.btn_use_current_book = ttk.Button(
+            row_preset1, text="使用当前作品", command=self._use_current_book_as_default
+        )
+        self.btn_use_current_book.pack(side="left", padx=(0, 10))
+        ttk.Label(
+            row_preset1,
+            text="默认模式与默认目录直接用下方“操作模式 / 章节文件夹”并自动保存",
+            foreground="gray",
+        ).pack(side="left", padx=4)
+
+        row_preset2 = ttk.Frame(frm_preset)
+        row_preset2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row_preset2, text="新建章节默认分卷:").pack(side="left")
+        self.default_new_volume_var = tk.StringVar(
+            value=str(self._cfg.get("default_new_chapter_volume", "") or "")
+        )
+        self.ent_default_new_volume = ttk.Entry(
+            row_preset2, textvariable=self.default_new_volume_var, width=22
+        )
+        self.ent_default_new_volume.pack(side="left", padx=4)
+        ttk.Label(row_preset2, text="规则: 第").pack(side="left", padx=(10, 0))
+        rules = self._cfg.get("new_chapter_volume_rules", [])
+        first_rule = rules[0] if isinstance(rules, list) and rules else {}
+        self.rule_min_chapter_var = tk.StringVar(
+            value=str(first_rule.get("min_chapter", "") or "")
+        )
+        self.ent_rule_min_chapter = ttk.Entry(
+            row_preset2, textvariable=self.rule_min_chapter_var, width=6
+        )
+        self.ent_rule_min_chapter.pack(side="left", padx=2)
+        ttk.Label(row_preset2, text="章及以后 ->").pack(side="left")
+        self.rule_volume_var = tk.StringVar(
+            value=str(first_rule.get("volume", "") or "")
+        )
+        self.ent_rule_volume = ttk.Entry(
+            row_preset2, textvariable=self.rule_volume_var, width=22
+        )
+        self.ent_rule_volume.pack(side="left", padx=4)
+        ttk.Label(
+            row_preset2, text="留空则关闭自动切卷规则", foreground="gray"
+        ).pack(side="left", padx=6)
+
         # --- 3. 章节文件夹 ---
         frm_dir = ttk.LabelFrame(self.root, text="章节文件夹")
         frm_dir.pack(fill="x", **pad)
@@ -352,6 +409,28 @@ class FanqieGUI:
         self.cmb_volume.bind("<<ComboboxSelected>>",
                              lambda _: self._on_volume_changed())
 
+        # 新建章节分卷选择（draft/publish/schedule 模式 + 多卷时显示）
+        self._new_volume_frame = ttk.Frame(frm_mode)
+        ttk.Label(self._new_volume_frame, text="新建章节分卷:").pack(
+            side="left", padx=(12, 0)
+        )
+        self.new_chapter_volume_var = tk.StringVar()
+        self.cmb_new_chapter_volume = ttk.Combobox(
+            self._new_volume_frame,
+            textvariable=self.new_chapter_volume_var,
+            state="readonly",
+            width=28,
+        )
+        self.cmb_new_chapter_volume.pack(side="left", padx=4, pady=4)
+        self.cmb_new_chapter_volume.bind(
+            "<<ComboboxSelected>>", lambda _: self._refresh_preview()
+        )
+        ttk.Label(
+            self._new_volume_frame,
+            text="留空则使用默认卷/自动规则",
+            foreground="gray",
+        ).pack(side="left", padx=6)
+
         # 定时发布设置子面板
         self.sched_frame = ttk.Frame(frm_mode)
 
@@ -388,6 +467,13 @@ class FanqieGUI:
         self.time_var.trace_add("write", lambda *_: self._sync_perday_from_times())
         # 持久化可配置项（不含日期，日期每天变化）
         for var in (self.perday_var, self.time_var):
+            var.trace_add("write", lambda *_: self._schedule_config_save())
+        for var in (
+            self.preferred_book_id_var,
+            self.default_new_volume_var,
+            self.rule_min_chapter_var,
+            self.rule_volume_var,
+        ):
             var.trace_add("write", lambda *_: self._schedule_config_save())
         # 启动时同步: config 可能有 per_day=2 但 times=3 个
         self._sync_perday_from_times()
@@ -596,11 +682,13 @@ class FanqieGUI:
         self._resched_filter_row.pack_forget()
         self.lbl_last_publish.pack_forget()
         self._volume_frame.pack_forget()
+        self._new_volume_frame.pack_forget()
         self.chk_use_ai.pack_forget()
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
         #   lbl_last_publish:   all modes
         #   _volume_frame:      edit, reschedule (仅多卷时；勾选"合并所有卷"时隐藏分卷下拉)
+        #   _new_volume_frame:  draft, publish, schedule (仅多卷时)
         #   sched_frame:        schedule, reschedule
         #   _resched_filter_row: all modes
         #   chk_use_ai:         schedule, publish, edit
@@ -615,6 +703,8 @@ class FanqieGUI:
                 self._lbl_volume_sep.pack(side="left", padx=(12, 0))
                 self.cmb_volume.pack(side="left", padx=2, pady=4)
             self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
+        if mode in ("draft", "publish", "schedule") and has_vols:
+            self._new_volume_frame.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "reschedule"):
             self.sched_frame.pack(fill="x", padx=6, pady=4)
         self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
@@ -718,6 +808,20 @@ class FanqieGUI:
         self._cfg["default_mode"] = self.mode_var.get()
         self._cfg["default_time"] = self.time_var.get().strip() or "08:00"
         self._cfg["chapters_dir"] = self.dir_var.get()
+        self._cfg["preferred_book_id"] = self.preferred_book_id_var.get().strip()
+        self._cfg["default_new_chapter_volume"] = self.default_new_volume_var.get().strip()
+        rule_min = self.rule_min_chapter_var.get().strip()
+        rule_volume = self.rule_volume_var.get().strip()
+        rules = []
+        if rule_min and rule_volume:
+            try:
+                rules.append({
+                    "min_chapter": int(rule_min),
+                    "volume": rule_volume,
+                })
+            except ValueError:
+                pass
+        self._cfg["new_chapter_volume_rules"] = rules
         try:
             self._cfg["default_per_day"] = self.perday_var.get()
         except tk.TclError:
@@ -775,6 +879,14 @@ class FanqieGUI:
         self.btn_open_manage.configure(state=ctrl_state)
         for rb in self._mode_radios:
             rb.configure(state=ctrl_state)
+        self.ent_preferred_book_id.configure(state=ctrl_state)
+        self.btn_use_current_book.configure(state=ctrl_state)
+        self.ent_default_new_volume.configure(state=ctrl_state)
+        self.ent_rule_min_chapter.configure(state=ctrl_state)
+        self.ent_rule_volume.configure(state=ctrl_state)
+        self.cmb_new_chapter_volume.configure(
+            state="disabled" if active else "readonly"
+        )
 
     # -----------------------------------------------------------------------
     # 快捷链接: 打开章节管理
@@ -931,9 +1043,10 @@ class FanqieGUI:
             self._hide_volumes()
 
     def _show_volumes(self, volumes):
-        """填充卷选项，在 edit/reschedule 模式下显示（紧跟 lbl_last_publish 之后）。"""
+        """填充卷选项，分别用于 edit/reschedule 与新建章节上传。"""
         texts = [v["text"] for v in volumes]
         self.cmb_volume["values"] = texts
+        self.cmb_new_chapter_volume["values"] = [""] + texts
         # 恢复优先级: 当前选择 > 平台活跃卷 > 首卷
         current = self.volume_var.get()
         if not (current and current in texts):
@@ -942,8 +1055,26 @@ class FanqieGUI:
                 self.cmb_volume.set(active[0])
             elif texts:
                 self.cmb_volume.set(texts[0])
-        # 仅 edit/reschedule 模式显示，用 after 保证位于 lbl_last_publish 之后
-        if self.mode_var.get() in ("edit", "reschedule"):
+        manual = self.new_chapter_volume_var.get()
+        if manual not in ("", *texts):
+            self.new_chapter_volume_var.set("")
+            manual = ""
+        if not manual:
+            preferred = str(self._cfg.get("default_new_chapter_volume", "") or "").strip()
+            if preferred and preferred in texts:
+                self.new_chapter_volume_var.set(preferred)
+            else:
+                rules = self._cfg.get("new_chapter_volume_rules", [])
+                if isinstance(rules, list):
+                    for rule in rules:
+                        if not isinstance(rule, dict):
+                            continue
+                        volume = str(rule.get("volume", "") or "").strip()
+                        if volume and volume in texts:
+                            self.new_chapter_volume_var.set(volume)
+                            break
+        mode = self.mode_var.get()
+        if mode in ("edit", "reschedule"):
             self._volume_frame.pack_forget()
             if self.all_volumes_var.get():
                 self._lbl_volume_sep.pack_forget()
@@ -951,14 +1082,31 @@ class FanqieGUI:
             else:
                 self._lbl_volume_sep.pack(side="left", padx=(12, 0))
                 self.cmb_volume.pack(side="left", padx=2, pady=4)
-            self._volume_frame.pack(
-                fill="x", padx=6, pady=(0, 4), after=self.lbl_last_publish)
+            self._volume_frame.pack(fill="x", padx=6, pady=(0, 4))
+        elif mode in ("draft", "publish", "schedule"):
+            self._new_volume_frame.pack(fill="x", padx=6, pady=(0, 4))
+        self._refresh_preview()
 
     def _hide_volumes(self):
         """清空卷选项并隐藏。"""
         self._volume_frame.pack_forget()
+        self._new_volume_frame.pack_forget()
         self.cmb_volume.set("")
         self.cmb_volume["values"] = []
+        self.new_chapter_volume_var.set("")
+        self.cmb_new_chapter_volume["values"] = []
+
+    def _get_manual_new_chapter_volume(self) -> str:
+        if self.mode_var.get() not in ("draft", "publish", "schedule"):
+            return ""
+        value = self.new_chapter_volume_var.get().strip()
+        return value
+
+    def _get_effective_new_chapter_volume(self, chapter_num: str | None) -> str:
+        manual = self._get_manual_new_chapter_volume()
+        if manual:
+            return manual
+        return resolve_new_chapter_volume(chapter_num, self._cfg)
 
     def _on_volume_changed(self):
         """用户切换了卷选择。"""
@@ -1342,19 +1490,30 @@ class FanqieGUI:
             for b in books
         ]
         self.cmb_book["values"] = display
-        # 恢复上次选择的作品（按账号区分），找不到则默认第一部
+        # 优先默认书号，其次恢复上次选择的作品（按账号区分），找不到则默认第一部
         acct = self._gui_state.get("current_account", "")
         key = f"last_book_id_{acct}" if acct else "last_book_id"
+        preferred_id = str(self._cfg.get("preferred_book_id", "") or "").strip()
         last_id = self._gui_state.get(key, "")
+        target_id = preferred_id or last_id
         target_idx = 0
-        if last_id:
+        if target_id:
             for i, b in enumerate(books):
-                if b["bookId"] == last_id:
+                if b["bookId"] == target_id:
                     target_idx = i
                     break
         self.cmb_book.current(target_idx)
         self._log(f"找到 {len(books)} 部作品。")
         self._on_book_changed()
+
+    def _use_current_book_as_default(self):
+        idx = self.cmb_book.current()
+        if idx < 0 or not self.books:
+            messagebox.showwarning("提示", "请先选择作品")
+            return
+        self.preferred_book_id_var.set(self.books[idx]["bookId"])
+        self._schedule_config_save()
+        self._log(f"默认书号已设置为: {self.books[idx]['bookId']}")
 
     # -----------------------------------------------------------------------
     # 目录选择 + 预览
@@ -1492,17 +1651,19 @@ class FanqieGUI:
             wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
             total_words += wc
             num_str = f"第{num}章" if num else "  ?  "
+            volume = self._get_effective_new_chapter_volume(num)
+            vol_str = f"  <{volume}>" if volume else ""
             if i in kept_set:
                 kept_words += wc
                 sched_str = ""
                 if schedule:
                     sched_str = f"  [{schedule[sched_idx][0]} {schedule[sched_idx][1]}]"
                 sched_idx += 1
-                lines.append(f"  {i+1:3d}. {num_str} {title}  ({wc}字){sched_str}")
+                lines.append(f"  {i+1:3d}. {num_str} {title}{vol_str}  ({wc}字){sched_str}")
             else:
                 status = "[跳过·无章节号]" if num is None else "[跳过·筛选]"
                 lines.append(
-                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
+                    f"  {i+1:3d}. {num_str} {title}{vol_str}  ({wc}字)  {status}")
 
         mode_labels = {"draft": "存草稿", "publish": "立即发布", "schedule": "定时发布",
                        "edit": "修改内容", "reschedule": "修改排期"}
@@ -1510,6 +1671,11 @@ class FanqieGUI:
         count_str = (f"{kept_count}/{len(self.files)}" if filter_active
                      else str(len(self.files)))
         summary = f"总计: {count_str} 章, {display_words} 字 | 模式: {mode_labels[mode]}"
+        manual_volume = self._get_manual_new_chapter_volume()
+        if manual_volume:
+            summary += f" | 分卷: {manual_volume}"
+        elif any(self._get_effective_new_chapter_volume(num) for num, _, _ in self.parsed_chapters):
+            summary += " | 分卷: 按规则/默认分卷"
         if schedule:
             # 统计首天章数即为 effective per_day
             first_day = schedule[0][0]
@@ -1748,6 +1914,7 @@ class FanqieGUI:
             return
 
         use_ai = self.use_ai_var.get()
+        manual_target_volume = self._get_manual_new_chapter_volume()
 
         # 复制数据避免主线程修改
         parsed = list(self.parsed_chapters)
@@ -1801,6 +1968,8 @@ class FanqieGUI:
         count_str = (f"{count}/{total_before_filter} 章（已筛选）"
                      if filter_active else f"{count} 章")
         msg = f"即将上传 {count_str} 到「{book_name}」\n模式: {mode_labels[mode]}"
+        if manual_target_volume:
+            msg += f"\n分卷: {manual_target_volume}"
         if schedule:
             msg += f"\n排期: {schedule[0][0]} ~ {schedule[-1][0]}"
         if not messagebox.askyesno("确认上传", msg):
@@ -1848,6 +2017,7 @@ class FanqieGUI:
                         if schedule:
                             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}"
                         logger.info(f"[{i+1}/{total}] {num_str}{title}{sched_info}")
+                        target_volume = self._get_effective_new_chapter_volume(chapter_num)
 
                         ok = False
                         daily_limit = False
@@ -1857,6 +2027,8 @@ class FanqieGUI:
                                     await page.goto(url)
                                     await wait_for_editor_ready(page)
 
+                                if target_volume:
+                                    await select_editor_volume(page, target_volume)
                                 await fill_chapter(page, chapter_num, title, content)
 
                                 if schedule:

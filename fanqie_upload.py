@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "default_per_day": 2,          # GUI 默认每天章数
     "default_time": "08:00",       # GUI 默认发布时间（支持逗号分隔多时间）
     "browser_timeout": 15000,      # 浏览器操作超时 (ms)
+    "default_new_chapter_volume": "",  # 新建章节默认分卷，如 "第二卷：回归"
+    "new_chapter_volume_rules": [],    # 按章节号自动切卷规则
 }
 
 # 平台修饰键 (macOS = Meta/Cmd, 其他 = Control)
@@ -873,6 +875,77 @@ SELECT_VOLUME_JS = r"""async (targetText) => {
 }"""
 
 
+# ---------------------------------------------------------------------------
+# JS: 检测新建章节页的卷列表
+# ---------------------------------------------------------------------------
+DETECT_EDITOR_VOLUMES_JS = r"""async () => {
+    const trigger = document.querySelector('.publish-header-volume-wrap-info-title');
+    if (!trigger) return { hasVolumes: false, volumes: [], currentVolume: '' };
+
+    const currentVolumeEl = trigger.querySelector('.publish-header-volume-name');
+    const currentVolume = currentVolumeEl ? currentVolumeEl.textContent.trim() : '';
+
+    trigger.click();
+    await new Promise(r => setTimeout(r, 500));
+
+    const volumes = [];
+    for (const opt of document.querySelectorAll('.editor-volume-list-item')) {
+        const txt = opt.textContent.trim();
+        if (txt) {
+            volumes.push({
+                text: txt,
+                isActive: opt.querySelector('.selected') !== null || txt === currentVolume,
+            });
+        }
+    }
+
+    const cancelBtn = [...document.querySelectorAll('button')].find(
+        el => el.textContent.trim() === '取消'
+    );
+    if (cancelBtn) cancelBtn.click();
+    await new Promise(r => setTimeout(r, 300));
+
+    return { hasVolumes: volumes.length > 1, volumes, currentVolume };
+}"""
+
+
+# ---------------------------------------------------------------------------
+# JS: 新建章节页选择指定卷
+# ---------------------------------------------------------------------------
+SELECT_EDITOR_VOLUME_JS = r"""async (targetText) => {
+    const trigger = document.querySelector('.publish-header-volume-wrap-info-title');
+    if (!trigger) return false;
+
+    trigger.click();
+    await new Promise(r => setTimeout(r, 500));
+
+    let matched = false;
+    for (const opt of document.querySelectorAll('.editor-volume-list-item')) {
+        if (opt.textContent.trim() === targetText) {
+            opt.click();
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) {
+        const cancelBtn = [...document.querySelectorAll('button')].find(
+            el => el.textContent.trim() === '取消'
+        );
+        if (cancelBtn) cancelBtn.click();
+        await new Promise(r => setTimeout(r, 300));
+        return false;
+    }
+
+    const confirmBtn = [...document.querySelectorAll('button')].find(
+        el => el.textContent.trim() === '确定'
+    );
+    if (!confirmBtn) return false;
+    confirmBtn.click();
+    await new Promise(r => setTimeout(r, 1000));
+    return true;
+}"""
+
+
 async def detect_volumes(page) -> dict:
     """检测章节管理页是否有多卷，返回 {hasVolumes, volumes, currentVolume}。"""
     try:
@@ -895,6 +968,65 @@ async def select_volume(page, volume_text: str) -> bool:
     except Exception as e:
         logger.warning(f"选择卷失败: {e}")
         return False
+
+
+async def detect_editor_volumes(page) -> dict:
+    """检测新建章节页是否有多卷，返回 {hasVolumes, volumes, currentVolume}。"""
+    try:
+        return await page.evaluate(DETECT_EDITOR_VOLUMES_JS)
+    except Exception as e:
+        logger.debug(f"检测编辑页卷列表失败: {e}")
+        return {"hasVolumes": False, "volumes": [], "currentVolume": ""}
+
+
+async def select_editor_volume(page, volume_text: str) -> bool:
+    """在新建章节页选择指定卷，返回是否成功。"""
+    try:
+        ok = await page.evaluate(SELECT_EDITOR_VOLUME_JS, volume_text)
+        if ok:
+            await page.wait_for_timeout(1000)
+            logger.info(f"  已切换到分卷: {volume_text}")
+        else:
+            logger.warning(f"  编辑页未找到分卷: {volume_text}")
+        return ok
+    except Exception as e:
+        logger.warning(f"编辑页切换分卷失败: {e}")
+        return False
+
+
+def resolve_new_chapter_volume(
+    chapter_num: str | None, cfg: dict
+) -> str:
+    """根据配置与章节号决定新建章节应落入的分卷。"""
+    chosen = str(cfg.get("default_new_chapter_volume", "") or "").strip()
+    if not chapter_num:
+        return chosen
+    try:
+        num = int(chapter_num)
+    except (TypeError, ValueError):
+        return chosen
+
+    rules = cfg.get("new_chapter_volume_rules", [])
+    if not isinstance(rules, list):
+        return chosen
+
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        volume = str(rule.get("volume", "") or "").strip()
+        if not volume:
+            continue
+        min_ch = rule.get("min_chapter")
+        max_ch = rule.get("max_chapter")
+        try:
+            if min_ch is not None and num < int(min_ch):
+                continue
+            if max_ch is not None and num > int(max_ch):
+                continue
+        except (TypeError, ValueError):
+            continue
+        return volume
+    return chosen
 
 
 async def extract_chapters_from_page(
@@ -1416,6 +1548,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
             num_str = f"第{chapter_num}章 " if chapter_num else ""
             sched_info = f" -> {schedule[i][0]} {schedule[i][1]}" if schedule else ""
             logger.info(f"[{i+1}/{len(files)}] {num_str}{title}{sched_info}")
+            target_volume = resolve_new_chapter_volume(chapter_num, cfg)
 
             ok = False
             daily_limit = False
@@ -1426,6 +1559,8 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         await page.goto(new_chapter_url)
                         await wait_for_editor_ready(page)
 
+                    if target_volume:
+                        await select_editor_volume(page, target_volume)
                     await fill_chapter(page, chapter_num, title, content)
 
                     if schedule:
