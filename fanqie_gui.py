@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-番茄作家 MD/TXT 批量上传工具 - GUI 界面
+番茄发布助手 - GUI 界面
 
 使用方法:
     python fanqie_gui.py
@@ -11,11 +11,13 @@ import json
 import logging
 import re
 import shutil
+import struct
 import unicodedata
 import sys
 import threading
 import tkinter as tk
 import webbrowser
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -53,6 +55,18 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 CHAPTER_MANAGE_URL = CHAPTER_MANAGE_URL_TPL
 DEFAULT_CHAPTERS_DIR = SCRIPT_DIR / "chapters"
+APP_USER_MODEL_ID = "fanqie.publisher.gui"
+APP_ICON_SIZE = 64
+APP_ICON_BLOCKS = (
+    ("#eef4ff", (0, 0, 64, 64)),
+    ("#2f6fed", (10, 10, 54, 54)),
+    ("#1f56c4", (14, 14, 50, 50)),
+    ("#ffffff", (19, 19, 45, 45)),
+    ("#2f6fed", (23, 18, 41, 24)),
+    ("#8eaef8", (23, 28, 41, 31)),
+    ("#8eaef8", (23, 35, 41, 38)),
+    ("#8eaef8", (23, 42, 36, 45)),
+)
 
 # 高 DPI 支持 (Windows)
 if sys.platform == "win32":
@@ -61,6 +75,87 @@ if sys.platform == "win32":
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+
+
+def _apply_windows_app_id():
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def _render_app_icon_rgba() -> bytearray:
+    size = APP_ICON_SIZE
+    pixels = bytearray(size * size * 4)
+    for color, (x1, y1, x2, y2) in APP_ICON_BLOCKS:
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+        for y in range(y1, y2):
+            row_offset = y * size * 4
+            for x in range(x1, x2):
+                idx = row_offset + x * 4
+                pixels[idx:idx + 4] = bytes((r, g, b, 255))
+    return pixels
+
+
+def _build_app_icon_ico() -> bytes:
+    size = APP_ICON_SIZE
+    rgba = _render_app_icon_rgba()
+    bmp = bytearray()
+    for y in range(size - 1, -1, -1):
+        row_offset = y * size * 4
+        for x in range(size):
+            idx = row_offset + x * 4
+            r, g, b, a = rgba[idx:idx + 4]
+            bmp.extend((b, g, r, a))
+
+    mask_row_size = ((size + 31) // 32) * 4
+    mask = bytes(mask_row_size * size)
+    image = struct.pack(
+        "<IiiHHIIiiII",
+        40,
+        size,
+        size * 2,
+        1,
+        32,
+        0,
+        len(bmp) + len(mask),
+        0,
+        0,
+        0,
+        0,
+    ) + bytes(bmp) + mask
+    return (
+        struct.pack("<HHH", 0, 1, 1)
+        + struct.pack(
+            "<BBBBHHII",
+            size if size < 256 else 0,
+            size if size < 256 else 0,
+            0,
+            0,
+            1,
+            32,
+            len(image),
+            22,
+        )
+        + image
+    )
+
+
+def _ensure_windows_icon_file() -> Path | None:
+    if sys.platform != "win32":
+        return None
+    icon_path = SCRIPT_DIR / ".fanqie_app.ico"
+    icon_bytes = _build_app_icon_ico()
+    try:
+        if (not icon_path.exists()) or icon_path.read_bytes() != icon_bytes:
+            icon_path.write_bytes(icon_bytes)
+    except OSError:
+        return None
+    return icon_path
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +262,33 @@ class _SharedBrowser:
 # ---------------------------------------------------------------------------
 class FanqieGUI:
 
+    BG = "#f3f6fb"
+    SURFACE = "#ffffff"
+    SURFACE_SOFT = "#eef3ff"
+    BORDER = "#d7e0f0"
+    TEXT = "#172033"
+    MUTED = "#607089"
+    ACCENT = "#2f6fed"
+    ACCENT_DEEP = "#1f56c4"
+    PREVIEW_BG = "#f7f9fc"
+    PREVIEW_TEXT = "#263248"
+    LOG_BG = "#101827"
+    LOG_TEXT = "#d7deed"
+
     def __init__(self):
+        _apply_windows_app_id()
         self.root = tk.Tk()
-        self.root.title("番茄作家 MD/TXT 批量上传工具")
-        _w, _h = 1100, 920
+        self.root.title("番茄发布助手")
+        _w, _h = 1240, 960
         self.root.update_idletasks()
         _sx = (self.root.winfo_screenwidth() - _w) // 2
         _sy = (self.root.winfo_screenheight() - _h) // 2
         self.root.geometry(f"{_w}x{_h}+{_sx}+{_sy}")
-        self.root.minsize(960, 820)
+        self.root.minsize(1080, 860)
+        self.root.configure(bg=self.BG)
+        self._app_icon = None
+        self._apply_theme()
+        self._install_app_icon()
 
         self.worker = AsyncWorker()
         self.worker.start()
@@ -207,11 +320,137 @@ class FanqieGUI:
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _apply_theme(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        self.font_ui = tkfont.nametofont("TkDefaultFont").copy()
+        self.font_ui.configure(family="Microsoft YaHei UI", size=10)
+        self.font_small = self.font_ui.copy()
+        self.font_small.configure(size=9)
+        self.font_heading = self.font_ui.copy()
+        self.font_heading.configure(size=18, weight="bold")
+        self.font_subheading = self.font_ui.copy()
+        self.font_subheading.configure(size=10)
+        self.font_mono = tkfont.Font(family="Consolas", size=10)
+
+        self.root.option_add("*Font", self.font_ui)
+        self.root.option_add("*Background", self.BG)
+
+        style.configure(".", background=self.BG, foreground=self.TEXT)
+        style.configure("TFrame", background=self.BG)
+        style.configure(
+            "TLabelframe",
+            background=self.SURFACE,
+            borderwidth=1,
+            relief="solid",
+            bordercolor=self.BORDER,
+            lightcolor=self.BORDER,
+            darkcolor=self.BORDER,
+            padding=10,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=self.SURFACE,
+            foreground=self.TEXT,
+            font=self.font_ui,
+        )
+        style.configure("TLabel", background=self.BG, foreground=self.TEXT)
+        style.configure("Hero.TFrame", background=self.SURFACE)
+        style.configure("HeroTitle.TLabel", background=self.SURFACE, foreground=self.TEXT, font=self.font_heading)
+        style.configure("HeroSub.TLabel", background=self.SURFACE, foreground=self.MUTED, font=self.font_subheading)
+        style.configure(
+            "Tag.TLabel",
+            background=self.SURFACE_SOFT,
+            foreground=self.ACCENT_DEEP,
+            font=self.font_small,
+            padding=(10, 5),
+        )
+        style.configure(
+            "TButton",
+            background=self.SURFACE,
+            foreground=self.TEXT,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(12, 8),
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#e9eefc"), ("pressed", "#dde7fb")],
+            foreground=[("disabled", "#8b97ad")],
+        )
+        style.configure("Accent.TButton", background=self.ACCENT, foreground="#ffffff", padding=(14, 9))
+        style.map(
+            "Accent.TButton",
+            background=[("active", self.ACCENT_DEEP), ("pressed", self.ACCENT_DEEP)],
+            foreground=[("disabled", "#dfe7fb")],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground="#fbfcff",
+            foreground=self.TEXT,
+            bordercolor=self.BORDER,
+            lightcolor=self.BORDER,
+            darkcolor=self.BORDER,
+            insertcolor=self.TEXT,
+            padding=6,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground="#fbfcff",
+            foreground=self.TEXT,
+            bordercolor=self.BORDER,
+            lightcolor=self.BORDER,
+            darkcolor=self.BORDER,
+            arrowsize=14,
+            padding=5,
+        )
+        style.map("TCombobox", fieldbackground=[("readonly", "#fbfcff")], foreground=[("readonly", self.TEXT)])
+        style.configure(
+            "Horizontal.TProgressbar",
+            background=self.ACCENT,
+            troughcolor="#e4ebfb",
+            borderwidth=0,
+            lightcolor=self.ACCENT,
+            darkcolor=self.ACCENT,
+        )
+
+    def _install_app_icon(self):
+        icon = tk.PhotoImage(width=APP_ICON_SIZE, height=APP_ICON_SIZE)
+        for color, rect in APP_ICON_BLOCKS:
+            icon.put(color, to=rect)
+        self._app_icon = icon
+        if sys.platform == "win32":
+            try:
+                icon_path = _ensure_windows_icon_file()
+                if icon_path:
+                    self.root.iconbitmap(str(icon_path.resolve()))
+            except Exception:
+                pass
+        try:
+            self.root.iconphoto(True, self._app_icon)
+        except Exception:
+            pass
+
     # -----------------------------------------------------------------------
     # UI 构建
     # -----------------------------------------------------------------------
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
+
+        hero = ttk.Frame(self.root, style="Hero.TFrame", padding=(20, 18))
+        hero.pack(fill="x", padx=8, pady=(10, 6))
+        hero_left = ttk.Frame(hero, style="Hero.TFrame")
+        hero_left.pack(side="left", fill="x", expand=True)
+        ttk.Label(hero_left, text="番茄发布助手", style="HeroTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            hero_left,
+            text="更适合个人连载工作流的草稿上传、分卷管理与定时排期桌面工具",
+            style="HeroSub.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
         # --- 1. 账号 ---
         frm = ttk.LabelFrame(self.root, text="账号")
@@ -221,15 +460,15 @@ class FanqieGUI:
             frm, textvariable=self.account_var, state="readonly", width=16)
         self.cmb_account.pack(side="left", padx=6, pady=4)
         self.cmb_account.bind("<<ComboboxSelected>>", self._on_account_selected)
-        self.btn_login = ttk.Button(frm, text="登录/新建", command=self._on_login)
+        self.btn_login = ttk.Button(frm, text="登录/新建", command=self._on_login, style="Accent.TButton")
         self.btn_login.pack(side="left", padx=6, pady=4)
         self.lbl_auth = ttk.Label(frm, text="")
         self.lbl_auth.pack(side="left", padx=6)
-        lbl_gh = ttk.Label(frm, text="GitHub", foreground="royalblue",
-                           cursor="hand2", font=("", 9, "underline"))
+        lbl_gh = ttk.Label(frm, text="GitHub", foreground=self.ACCENT,
+                           cursor="hand2", font=(self.font_ui.actual("family"), 9, "underline"))
         lbl_gh.pack(side="right", padx=8)
         lbl_gh.bind("<Button-1>", lambda _: webbrowser.open(
-            "https://github.com/rockbenben/fanqie-publisher"))
+            "https://github.com/chasecode26/fanqie-publisher"))
         self._refresh_account_list()
         self._refresh_auth_status()
 
@@ -504,36 +743,61 @@ class FanqieGUI:
             self._resched_filter_row, text="", foreground="gray")
         self.lbl_resched_filter_info.pack(side="left", padx=6)
 
-        # --- 5. 章节预览 ---
-        frm = ttk.LabelFrame(self.root, text="章节预览")
-        frm.pack(fill="both", expand=True, **pad)
+        # --- 5. 上传控制 ---
+        action_bar = ttk.LabelFrame(self.root, text="执行")
+        action_bar.pack(fill="x", **pad)
+        self.btn_upload = ttk.Button(
+            action_bar, text="开始上传", command=self._on_upload, style="Accent.TButton")
+        self.btn_upload.pack(side="left", padx=6, pady=4)
+        self.progress = ttk.Progressbar(action_bar, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        self.lbl_progress = ttk.Label(action_bar, text="")
+        self.lbl_progress.pack(side="left", padx=6, pady=4)
+
+        # --- 6. 工作台 ---
+        workspace = ttk.Panedwindow(self.root, orient="horizontal")
+        workspace.pack(fill="both", expand=True, **pad)
+
+        preview_frame = ttk.LabelFrame(workspace, text="章节预览")
+        preview_meta = ttk.Frame(preview_frame)
+        preview_meta.pack(fill="x", padx=4, pady=(2, 0))
+        ttk.Label(
+            preview_meta,
+            text="上传前检查章节顺序、分卷与排期。",
+            foreground=self.MUTED,
+        ).pack(side="left", padx=4, pady=(0, 4))
         self.txt_preview = scrolledtext.ScrolledText(
-            frm, height=8, state="disabled", wrap="none",
-            font=("Consolas", 9))
+            preview_frame, height=8, state="disabled", wrap="none",
+            font=self.font_mono,
+            background=self.PREVIEW_BG,
+            foreground=self.PREVIEW_TEXT,
+            insertbackground=self.PREVIEW_TEXT,
+            relief="flat",
+            bd=0)
         self.txt_preview.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # --- 6. 上传控制 ---
-        frm = ttk.Frame(self.root)
-        frm.pack(fill="x", **pad)
-        self.btn_upload = ttk.Button(
-            frm, text="开始上传", command=self._on_upload)
-        self.btn_upload.pack(side="left", padx=6)
-        self.progress = ttk.Progressbar(frm, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=6)
-        self.lbl_progress = ttk.Label(frm, text="")
-        self.lbl_progress.pack(side="left", padx=6)
-
-        # --- 7. 运行日志 ---
-        frm = ttk.LabelFrame(self.root, text="运行日志")
-        frm.pack(fill="both", expand=True, **pad)
-        log_bar = ttk.Frame(frm)
+        log_frame = ttk.LabelFrame(workspace, text="运行日志")
+        log_bar = ttk.Frame(log_frame)
         log_bar.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(
+            log_bar,
+            text="保留上传过程与错误信息，便于排查。",
+            foreground=self.MUTED,
+        ).pack(side="left", padx=4)
         ttk.Button(log_bar, text="导出日志", command=self._export_log).pack(
             side="right")
         self.txt_log = scrolledtext.ScrolledText(
-            frm, height=8, state="disabled",
-            font=("Consolas", 9))
+            log_frame, height=8, state="disabled",
+            font=self.font_mono,
+            background=self.LOG_BG,
+            foreground=self.LOG_TEXT,
+            insertbackground=self.LOG_TEXT,
+            relief="flat",
+            bd=0)
         self.txt_log.pack(fill="both", expand=True, padx=4, pady=4)
+
+        workspace.add(preview_frame, weight=3)
+        workspace.add(log_frame, weight=2)
 
         # 所有组件创建完毕，统一设置初始模式的面板可见性
         self._on_mode_change()
