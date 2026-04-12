@@ -28,12 +28,14 @@ try:
         parse_md_file, get_md_files, strip_md_formatting,
         deduplicate_titles, compute_schedule, _validate_times,
         DailyLimitReached, _check_daily_limit,
+        is_daily_limit_exception, daily_limit_stop_message,
         create_context, save_auth,
         wait_for_editor_ready, fill_chapter,
-        save_draft, publish_scheduled, _navigate_to_publish_settings,
+        save_draft, publish_scheduled, confirm_publish, _navigate_to_publish_settings,
         extract_chapters_from_page, match_chapters, edit_one_chapter,
+        attach_chapter_network_logger,
         reschedule_on_manage_page, detect_volumes, select_volume,
-        select_editor_volume, resolve_new_chapter_volume,
+        select_editor_volume, resolve_new_chapter_volume, resolve_volume_name,
         AUTH_FILE, BASE_URL, BOOK_MANAGE_URL, NEW_CHAPTER_URL_TPL,
         CHAPTER_MANAGE_URL_TPL, SCRIPT_DIR, ZONE_URL, CONFIG_FILE, GUI_STATE_FILE,
         BOOKS_JS, LAST_PUBLISH_JS,
@@ -156,6 +158,51 @@ def _ensure_windows_icon_file() -> Path | None:
     except OSError:
         return None
     return icon_path
+
+
+def parse_chapter_selector(raw: str) -> tuple[str, object]:
+    """解析章节筛选表达式。
+
+    支持:
+      - 单值: 5
+      - 区间: 5-10 / 5~10
+      - 离散/混合: 1,5,8-10
+    """
+    text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+    if not text:
+        raise ValueError("empty")
+
+    m = re.match(r"^(\d+)\s*[-~]\s*(\d+)$", text)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+        return "range", (lo, hi)
+
+    if "," in text or "，" in text:
+        selected: set[int] = set()
+        for part in re.split(r"[,，]", text):
+            token = part.strip()
+            if not token:
+                continue
+            m = re.match(r"^(\d+)\s*[-~]\s*(\d+)$", token)
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2))
+                if lo > hi:
+                    lo, hi = hi, lo
+                selected.update(range(lo, hi + 1))
+            elif token.isdigit():
+                selected.add(int(token))
+            else:
+                raise ValueError(token)
+        if not selected:
+            raise ValueError("empty")
+        return "set", selected
+
+    if text.isdigit():
+        return "single", int(text)
+
+    raise ValueError(text)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +557,15 @@ class FanqieGUI:
             text="默认模式与默认目录直接用下方“操作模式 / 章节文件夹”并自动保存",
             foreground="gray",
         ).pack(side="left", padx=4)
+        self.headless_var = tk.BooleanVar(
+            value=bool(self._cfg.get("headless", False))
+        )
+        ttk.Checkbutton(
+            row_preset1,
+            text="后台运行（无头）",
+            variable=self.headless_var,
+            command=self._schedule_config_save,
+        ).pack(side="left", padx=(12, 0))
 
         row_preset2 = ttk.Frame(frm_preset)
         row_preset2.pack(fill="x", padx=6, pady=(0, 4))
@@ -620,9 +676,18 @@ class FanqieGUI:
         row_opts = ttk.Frame(frm_mode)
         row_opts.pack(fill="x", padx=6, pady=(0, 4))
         self.use_ai_var = tk.BooleanVar(value=False)
+        self.edit_match_number_only_var = tk.BooleanVar(
+            value=bool(self._gui_state.get("edit_match_number_only", False))
+        )
         self.chk_use_ai = ttk.Checkbutton(
             row_opts, text="稿件使用了AI创作", variable=self.use_ai_var)
         self.chk_use_ai.pack(side="left", padx=6)
+        self.chk_edit_match_number_only = ttk.Checkbutton(
+            row_opts,
+            text="仅按章节号匹配（修改内容）",
+            variable=self.edit_match_number_only_var,
+            command=self._on_edit_match_mode_changed,
+        )
 
         # 上次发布信息（所有模式可见）
         self.lbl_last_publish = ttk.Label(
@@ -730,15 +795,33 @@ class FanqieGUI:
             values=["≤", "≥"], width=3, state="readonly")
         self.cmb_resched_filter_op.pack(side="left", padx=2)
         self.cmb_resched_filter_op.bind("<<ComboboxSelected>>",
-                                        lambda _: self._refresh_preview())
-        ttk.Label(self._resched_filter_row, text="第").pack(side="left", padx=(4, 0))
+                                        lambda _: self._on_chapter_filter_changed())
+        ttk.Label(self._resched_filter_row, text="章节号").pack(side="left", padx=(4, 0))
         self.resched_filter_num_var = tk.StringVar(value="1")
         self.ent_resched_filter_num = ttk.Entry(
             self._resched_filter_row, textvariable=self.resched_filter_num_var, width=8)
         self.ent_resched_filter_num.pack(side="left", padx=2)
-        ttk.Label(self._resched_filter_row, text="章").pack(side="left")
-        self.resched_filter_num_var.trace_add("write", lambda *_: self._refresh_preview())
+        ttk.Label(
+            self._resched_filter_row,
+            text="支持 5 / 5-10 / 1,5,8-10",
+            foreground="gray",
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(
+            self._resched_filter_row,
+            text="选择章节…",
+            command=self._open_chapter_picker,
+        ).pack(side="left", padx=(8, 0))
+        self.resched_filter_num_var.trace_add("write", lambda *_: self._on_chapter_filter_changed())
         self.ent_resched_filter_num.bind("<Return>", lambda _: self.txt_preview.focus_set())
+        self._lbl_edit_limit = ttk.Label(self._resched_filter_row, text="最多修改:")
+        self.edit_limit_count_var = tk.StringVar(value="")
+        self.ent_edit_limit_count = ttk.Entry(
+            self._resched_filter_row, textvariable=self.edit_limit_count_var, width=6
+        )
+        self._lbl_edit_limit_unit = ttk.Label(self._resched_filter_row, text="章")
+        self._edit_limit_user_dirty = False
+        self._setting_edit_limit_default = False
+        self.edit_limit_count_var.trace_add("write", lambda *_: self._on_edit_limit_changed())
         self.lbl_resched_filter_info = ttk.Label(
             self._resched_filter_row, text="", foreground="gray")
         self.lbl_resched_filter_info.pack(side="left", padx=6)
@@ -766,6 +849,43 @@ class FanqieGUI:
             text="上传前检查章节顺序、分卷与排期。",
             foreground=self.MUTED,
         ).pack(side="left", padx=4, pady=(0, 4))
+        self._chapter_selector_syncing = False
+        self._chapter_selector_items: list[tuple[int, str]] = []
+        selector_frame = ttk.LabelFrame(preview_frame, text="章节选择")
+        selector_frame.pack(fill="x", padx=4, pady=(0, 4))
+        selector_bar = ttk.Frame(selector_frame)
+        selector_bar.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(
+            selector_bar,
+            text="勾选后会自动同步到上方筛选框。",
+            foreground=self.MUTED,
+        ).pack(side="left")
+        ttk.Button(selector_bar, text="全选", command=self._chapter_selector_select_all).pack(side="right", padx=(6, 0))
+        ttk.Button(selector_bar, text="清空", command=self._chapter_selector_clear).pack(side="right")
+        ttk.Button(selector_bar, text="奇数章", command=self._chapter_selector_select_odd).pack(side="right", padx=(6, 0))
+        ttk.Button(selector_bar, text="偶数章", command=self._chapter_selector_select_even).pack(side="right", padx=(6, 0))
+        ttk.Label(selector_bar, text="最近").pack(side="right", padx=(6, 2))
+        self.chapter_recent_count_var = tk.StringVar(value="5")
+        ttk.Entry(selector_bar, textvariable=self.chapter_recent_count_var, width=4).pack(side="right")
+        ttk.Button(selector_bar, text="章", command=self._chapter_selector_select_recent).pack(side="right", padx=(2, 0))
+        selector_list_frame = ttk.Frame(selector_frame)
+        selector_list_frame.pack(fill="x", padx=4, pady=(0, 4))
+        self.lst_chapter_selector = tk.Listbox(
+            selector_list_frame,
+            height=7,
+            selectmode=tk.EXTENDED,
+            activestyle="dotbox",
+            exportselection=False,
+        )
+        self.lst_chapter_selector.pack(side="left", fill="x", expand=True)
+        self.lst_chapter_selector.bind("<<ListboxSelect>>", lambda _e: self._on_chapter_selector_changed())
+        selector_scroll = ttk.Scrollbar(
+            selector_list_frame,
+            orient="vertical",
+            command=self.lst_chapter_selector.yview,
+        )
+        selector_scroll.pack(side="right", fill="y")
+        self.lst_chapter_selector.configure(yscrollcommand=selector_scroll.set)
         self.txt_preview = scrolledtext.ScrolledText(
             preview_frame, height=8, state="disabled", wrap="none",
             font=self.font_mono,
@@ -940,6 +1060,8 @@ class FanqieGUI:
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
+        if mode != "edit":
+            self._edit_limit_user_dirty = False
 
         # --- 1. 先隐藏所有可选组件 ---
         self.sched_frame.pack_forget()
@@ -948,6 +1070,10 @@ class FanqieGUI:
         self._volume_frame.pack_forget()
         self._new_volume_frame.pack_forget()
         self.chk_use_ai.pack_forget()
+        self.chk_edit_match_number_only.pack_forget()
+        self._lbl_edit_limit.pack_forget()
+        self.ent_edit_limit_count.pack_forget()
+        self._lbl_edit_limit_unit.pack_forget()
 
         # --- 2. 按模式显示组件（注意 pack 顺序决定布局顺序） ---
         #   lbl_last_publish:   all modes
@@ -974,6 +1100,11 @@ class FanqieGUI:
         self._resched_filter_row.pack(fill="x", padx=6, pady=(0, 4))
         if mode in ("schedule", "publish", "edit"):
             self.chk_use_ai.pack(side="left", padx=6)
+        if mode == "edit":
+            self.chk_edit_match_number_only.pack(side="left", padx=6)
+            self._lbl_edit_limit.pack(side="left", padx=(12, 4))
+            self.ent_edit_limit_count.pack(side="left", padx=2)
+            self._lbl_edit_limit_unit.pack(side="left")
 
         # --- 3. 上传按钮文字和状态 ---
         btn_text = {"edit": "开始修改", "reschedule": "开始修改"}.get(
@@ -1029,6 +1160,98 @@ class FanqieGUI:
         self.txt_preview.insert("1.0", text)
         self.txt_preview.configure(state="disabled")
 
+    def _set_chapter_selector_nums(self, selected_nums):
+        selected_nums = {int(n) for n in selected_nums}
+        self._chapter_selector_syncing = True
+        try:
+            self.lst_chapter_selector.selection_clear(0, tk.END)
+            for idx, (num, _) in enumerate(self._chapter_selector_items):
+                if int(num) in selected_nums:
+                    self.lst_chapter_selector.selection_set(idx)
+        finally:
+            self._chapter_selector_syncing = False
+
+    def _sync_chapter_selector_from_filter(self):
+        raw = unicodedata.normalize("NFKC", self.resched_filter_num_var.get()).strip()
+        if not raw:
+            self._set_chapter_selector_nums(set())
+            return
+        try:
+            selector_kind, selector_value = parse_chapter_selector(raw)
+        except ValueError:
+            self._set_chapter_selector_nums(set())
+            return
+
+        nums = [int(num) for num, _ in self._chapter_selector_items]
+        selected: set[int] = set()
+        if selector_kind == "single":
+            selected = {int(selector_value)}
+        elif selector_kind == "range":
+            lo, hi = selector_value
+            selected = {n for n in nums if lo <= n <= hi}
+        elif selector_kind == "set":
+            selected = {int(n) for n in selector_value}
+        self._set_chapter_selector_nums(selected)
+
+    def _refresh_chapter_selector_panel(self):
+        items = self._get_chapter_picker_items()
+        self._chapter_selector_items = items
+        self.lst_chapter_selector.delete(0, tk.END)
+        for _, label in items:
+            self.lst_chapter_selector.insert(tk.END, label)
+        self._sync_chapter_selector_from_filter()
+
+    def _chapter_selector_get_selected_nums(self) -> list[int]:
+        return sorted({
+            int(self._chapter_selector_items[i][0])
+            for i in self.lst_chapter_selector.curselection()
+            if 0 <= i < len(self._chapter_selector_items)
+        })
+
+    def _chapter_selector_apply_nums(self, nums):
+        nums = sorted({int(n) for n in nums})
+        self._chapter_selector_syncing = True
+        try:
+            self.resched_filter_var.set(bool(nums))
+            self.resched_filter_num_var.set(",".join(str(n) for n in nums) if nums else "")
+        finally:
+            self._chapter_selector_syncing = False
+        self._set_chapter_selector_nums(nums)
+        self._refresh_preview()
+
+    def _on_chapter_selector_changed(self):
+        if self._chapter_selector_syncing:
+            return
+        self._chapter_selector_apply_nums(self._chapter_selector_get_selected_nums())
+
+    def _chapter_selector_select_all(self):
+        self._chapter_selector_apply_nums(num for num, _ in self._chapter_selector_items)
+
+    def _chapter_selector_clear(self):
+        self._chapter_selector_apply_nums([])
+
+    def _chapter_selector_select_odd(self):
+        self._chapter_selector_apply_nums(
+            num for num, _ in self._chapter_selector_items if int(num) % 2 == 1
+        )
+
+    def _chapter_selector_select_even(self):
+        self._chapter_selector_apply_nums(
+            num for num, _ in self._chapter_selector_items if int(num) % 2 == 0
+        )
+
+    def _chapter_selector_select_recent(self):
+        try:
+            recent_count = int(str(self.chapter_recent_count_var.get()).strip() or "0")
+        except ValueError:
+            messagebox.showwarning("提示", "最近章节数量请输入数字。")
+            return
+        if recent_count <= 0:
+            messagebox.showwarning("提示", "最近章节数量需大于 0。")
+            return
+        nums = [int(num) for num, _ in self._chapter_selector_items]
+        self._chapter_selector_apply_nums(nums[-recent_count:])
+
     def _export_log(self):
         """导出运行日志到文件。"""
         content = self.txt_log.get("1.0", tk.END).strip()
@@ -1073,6 +1296,7 @@ class FanqieGUI:
         self._cfg["default_time"] = self.time_var.get().strip() or "08:00"
         self._cfg["chapters_dir"] = self.dir_var.get()
         self._cfg["preferred_book_id"] = self.preferred_book_id_var.get().strip()
+        self._cfg["headless"] = bool(self.headless_var.get())
         self._cfg["default_new_chapter_volume"] = self.default_new_volume_var.get().strip()
         rule_min = self.rule_min_chapter_var.get().strip()
         rule_volume = self.rule_volume_var.get().strip()
@@ -1116,6 +1340,28 @@ class FanqieGUI:
                 f.write("\n")
         except Exception:
             pass
+
+    def _on_edit_match_mode_changed(self):
+        self._gui_state["edit_match_number_only"] = self.edit_match_number_only_var.get()
+        self._save_gui_state()
+        self._edit_limit_user_dirty = False
+        if self.mode_var.get() == "edit":
+            self._refresh_preview()
+
+    def _on_chapter_filter_changed(self):
+        if not self._chapter_selector_syncing:
+            self._sync_chapter_selector_from_filter()
+        if self.mode_var.get() == "edit":
+            self._edit_limit_user_dirty = False
+        self._refresh_preview()
+
+    def _on_edit_limit_changed(self):
+        if self.mode_var.get() != "edit":
+            return
+        if self._setting_edit_limit_default:
+            return
+        self._edit_limit_user_dirty = True
+        self._refresh_preview()
 
     def _set_uploading(self, active):
         self.uploading = active
@@ -1169,6 +1415,7 @@ class FanqieGUI:
     # -----------------------------------------------------------------------
     def _on_book_changed(self):
         self._fetch_gen += 1
+        self._edit_limit_user_dirty = False
 
         idx = self.cmb_book.current()
         if idx < 0 or not self.books:
@@ -1322,21 +1569,6 @@ class FanqieGUI:
         manual = self.new_chapter_volume_var.get()
         if manual not in ("", *texts):
             self.new_chapter_volume_var.set("")
-            manual = ""
-        if not manual:
-            preferred = str(self._cfg.get("default_new_chapter_volume", "") or "").strip()
-            if preferred and preferred in texts:
-                self.new_chapter_volume_var.set(preferred)
-            else:
-                rules = self._cfg.get("new_chapter_volume_rules", [])
-                if isinstance(rules, list):
-                    for rule in rules:
-                        if not isinstance(rule, dict):
-                            continue
-                        volume = str(rule.get("volume", "") or "").strip()
-                        if volume and volume in texts:
-                            self.new_chapter_volume_var.set(volume)
-                            break
         mode = self.mode_var.get()
         if mode in ("edit", "reschedule"):
             self._volume_frame.pack_forget()
@@ -1368,9 +1600,39 @@ class FanqieGUI:
 
     def _get_effective_new_chapter_volume(self, chapter_num: str | None) -> str:
         manual = self._get_manual_new_chapter_volume()
-        if manual:
-            return manual
-        return resolve_new_chapter_volume(chapter_num, self._cfg)
+        idx = self.cmb_book.current()
+        volumes = None
+        current_volume = ""
+        if idx >= 0 and self.books:
+            book_id = self.books[idx]["bookId"]
+            cached = self._volumes_cache.get(book_id)
+            if isinstance(cached, list):
+                volumes = cached
+                current_volume = next(
+                    (str(v.get("text", "") or "") for v in cached if isinstance(v, dict) and v.get("isActive")),
+                    "",
+                )
+        target = manual or resolve_new_chapter_volume(
+            chapter_num,
+            self._cfg,
+            volumes=volumes,
+            current_volume=current_volume,
+        )
+        if not target:
+            return ""
+
+        if idx < 0 or not self.books:
+            return target
+
+        book_id = self.books[idx]["bookId"]
+        if book_id not in self._volumes_cache:
+            return target
+
+        volumes = self._volumes_cache.get(book_id)
+        if not volumes:
+            return ""
+
+        return resolve_volume_name(target, volumes, current_volume)
 
     def _on_volume_changed(self):
         """用户切换了卷选择。"""
@@ -1379,6 +1641,7 @@ class FanqieGUI:
             return
 
         self._fetch_gen += 1  # 使正在进行的后台任务过期
+        self._edit_limit_user_dirty = False
 
         mode = self.mode_var.get()
         if mode in ("edit", "reschedule"):
@@ -1396,6 +1659,7 @@ class FanqieGUI:
             self._save_gui_state()
 
         self._fetch_gen += 1
+        self._edit_limit_user_dirty = False
         # 刷新布局: 勾选时隐藏卷选择器，取消时显示
         self._on_mode_change()
 
@@ -1442,6 +1706,7 @@ class FanqieGUI:
             try:
                 ctx = await self._shared.ensure()
                 page = await ctx.new_page()
+                attach_chapter_network_logger(page, tag="edit-fetch")
                 if self._fetch_gen != gen:
                     return
                 url = CHAPTER_MANAGE_URL.format(book_id=book_id)
@@ -1464,6 +1729,7 @@ class FanqieGUI:
                 if fetch_all_vols and has_vols and vol_list:
                     all_chapters = []
                     last_pub = None
+                    logger.info(f"合并所有卷: 共检测到 {len(vol_list)} 个分卷")
                     for vi, vol in enumerate(vol_list):
                         vol_name = vol["text"] if isinstance(vol, dict) else vol
                         if self._fetch_gen != gen:
@@ -1471,8 +1737,28 @@ class FanqieGUI:
                         msg = f"正在索引分卷 ({vi+1}/{len(vol_list)}): {vol_name}..."
                         self._after(0, lambda m=msg: self.lbl_last_publish.configure(
                             text=m, foreground="gray"))
-                        await select_volume(page, vol_name)
+                        ok = await select_volume(page, vol_name)
+                        if not ok:
+                            logger.warning(f"分卷切换失败，跳过: {vol_name}")
+                            continue
                         chs, lp = await extract_chapters_from_page(page, book_id)
+                        if not chs:
+                            logger.warning(f"分卷首次抓取为空，重试: {vol_name}")
+                            await page.wait_for_timeout(1500)
+                            ok = await select_volume(page, vol_name)
+                            if ok:
+                                chs, lp = await extract_chapters_from_page(page, book_id)
+                        nums = sorted({
+                            int(ch["chapterNum"])
+                            for ch in chs
+                            if ch.get("chapterNum") is not None
+                        })
+                        if nums:
+                            logger.info(
+                                f"分卷抓取完成: {vol_name} -> {len(chs)}章, 章节号 {nums[0]}-{nums[-1]}"
+                            )
+                        else:
+                            logger.info(f"分卷抓取完成: {vol_name} -> {len(chs)}章, 未识别章节号")
                         all_chapters.extend(chs)
                         if lp and not last_pub:
                             last_pub = lp
@@ -1873,6 +2159,7 @@ class FanqieGUI:
     def _refresh_preview(self):
         """仅重新计算排期和刷新预览文本，不重新读取文件。"""
         mode = self.mode_var.get()
+        self._refresh_chapter_selector_panel()
 
         # 修改排期模式: 不依赖本地文件，使用平台章节
         if mode == "reschedule":
@@ -1969,7 +2256,11 @@ class FanqieGUI:
 
         if platform_chapters:
             matched, unmatched = match_chapters(
-                self.parsed_chapters, platform_chapters)
+                self.parsed_chapters,
+                platform_chapters,
+                number_only=self.edit_match_number_only_var.get(),
+                exclude_draft=True,
+            )
 
             # 按章节序号筛选
             all_matched_indices = {m[0] for m in matched}
@@ -1978,9 +2269,35 @@ class FanqieGUI:
             filtered_out_indices = (all_matched_indices - {m[0] for m in matched}
                                     if filter_active else set())
 
-            self._matched_edit = matched
-            matched_count = len(matched)
-            matched_indices = {m[0] for m in matched}
+            available_count = len(matched)
+            if (not self._edit_limit_user_dirty) or (not str(self.edit_limit_count_var.get()).strip()):
+                self._setting_edit_limit_default = True
+                self.edit_limit_count_var.set(str(available_count))
+                self._setting_edit_limit_default = False
+                self._edit_limit_user_dirty = False
+
+            try:
+                raw_limit = int(str(self.edit_limit_count_var.get()).strip() or "0")
+            except ValueError:
+                raw_limit = 0
+            limit_count = max(0, min(raw_limit, available_count)) if available_count else 0
+            if available_count and raw_limit <= 0:
+                limit_count = available_count
+
+            limited_matched = matched[:limit_count]
+            limit_skipped_indices = {m[0] for m in matched[limit_count:]}
+
+            self._matched_edit = limited_matched
+            matched_count = len(limited_matched)
+            matched_indices = {m[0] for m in limited_matched}
+            platform_title_by_local = {
+                m[0]: str((m[1] or {}).get("title", "") or "")
+                for m in limited_matched
+            }
+            platform_status_by_local = {
+                m[0]: str((m[1] or {}).get("status", "") or "")
+                for m in limited_matched
+            }
 
             for i, (num, title, content) in enumerate(self.parsed_chapters):
                 wc = self._word_counts[i] if i < len(self._word_counts) else len(strip_md_formatting(content))
@@ -1988,14 +2305,23 @@ class FanqieGUI:
                 num_str = f"第{num}章" if num else "  ?  "
                 if i in matched_indices:
                     status = "[匹配]"
+                elif i in limit_skipped_indices:
+                    status = "[跳过·超出数量]"
                 elif i in filtered_out_indices:
                     status = "[跳过·筛选]"
                 elif num is None:
                     status = "[跳过·无章节号]"
                 else:
                     status = "[跳过·未找到]"
+                plat_title = platform_title_by_local.get(i, "")
+                plat_status = platform_status_by_local.get(i, "")
+                plat_suffix = ""
+                if i in matched_indices and plat_title and plat_title != title:
+                    plat_suffix += f"  -> 平台原标题: {plat_title}"
+                if i in matched_indices and plat_status:
+                    plat_suffix += f"  [平台状态: {plat_status}]"
                 lines.append(
-                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}")
+                    f"  {i+1:3d}. {num_str} {title}  ({wc}字)  {status}{plat_suffix}")
         else:
             self._matched_edit = []
             for i, (num, title, content) in enumerate(self.parsed_chapters):
@@ -2007,7 +2333,24 @@ class FanqieGUI:
 
         summary = f"总计: {len(self.files)} 章, {total_words} 字 | 模式: 修改内容"
         if platform_chapters:
-            summary += f" | 匹配: {matched_count}/{len(self.files)}"
+            summary += f" | 匹配候选: {available_count}/{len(self.files)}"
+            summary += f" | 待修改: {matched_count}"
+        summary += " | 匹配规则: 仅章节号" if self.edit_match_number_only_var.get() else " | 匹配规则: 章节号+标题"
+        if self.all_volumes_var.get():
+            summary += " | 范围: 合并所有卷"
+        missing_local_num = sum(1 for num, _, _ in self.parsed_chapters if num is None)
+        if missing_local_num:
+            summary += f" | 本地无章节号: {missing_local_num}"
+        if platform_chapters:
+            platform_nums = sorted({
+                int(ch["chapterNum"])
+                for ch in platform_chapters
+                if ch.get("chapterNum") is not None
+            })
+            if platform_nums:
+                summary += f" | 平台章节号: {platform_nums[0]}-{platform_nums[-1]} ({len(platform_nums)}章)"
+            else:
+                summary += " | 平台章节号: 0"
 
         self._set_preview(summary + "\n" + "-" * 60 + "\n" + "\n".join(lines))
         self.progress["maximum"] = max(matched_count, 1)
@@ -2018,7 +2361,7 @@ class FanqieGUI:
         """按章节序号筛选列表。
 
         key(item) 提取章节序号 (int 或 None, None 视为不匹配)。
-        支持单值 (≤/≥) 和范围 (如 5-10)。
+        支持单值 (≤/≥)、范围 (如 5-10) 与离散/混合选择 (如 1,5,8-10)。
         返回 (filtered_items, is_active)。同时更新筛选信息标签。
         """
         # 默认恢复运算符下拉框（范围格式时会覆盖为 disabled）
@@ -2037,12 +2380,15 @@ class FanqieGUI:
 
         total = len(items)
 
-        # 范围格式: "5-10" / "5~10"
-        m = re.match(r'^(\d+)\s*[-~]\s*(\d+)$', raw)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo > hi:
-                lo, hi = hi, lo
+        try:
+            selector_kind, selector_value = parse_chapter_selector(raw)
+        except ValueError:
+            self.lbl_resched_filter_info.configure(
+                text="请输入数字、范围(5-10)或列表(1,5,8-10)", foreground="red")
+            return items, False
+
+        if selector_kind == "range":
+            lo, hi = selector_value
             self.cmb_resched_filter_op.configure(state="disabled")
             kept = [x for x in items
                     if (n := key(x)) is not None and lo <= int(n) <= hi]
@@ -2050,13 +2396,16 @@ class FanqieGUI:
                 text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
             return kept, True
 
-        # 单值格式: ≤ / ≥
-        try:
-            threshold = int(raw)
-        except ValueError:
+        if selector_kind == "set":
+            selected_nums = selector_value
+            self.cmb_resched_filter_op.configure(state="disabled")
+            kept = [x for x in items
+                    if (n := key(x)) is not None and int(n) in selected_nums]
             self.lbl_resched_filter_info.configure(
-                text="请输入数字或范围(如 5-10)", foreground="red")
-            return items, False
+                text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
+            return kept, True
+
+        threshold = selector_value
         op = self.resched_filter_op_var.get()
         if op == "≤":
             kept = [x for x in items if (n := key(x)) is not None and int(n) <= threshold]
@@ -2065,6 +2414,118 @@ class FanqieGUI:
         self.lbl_resched_filter_info.configure(
             text=f"筛选: {len(kept)}/{total} 章", foreground="gray")
         return kept, True
+
+    def _get_chapter_picker_items(self) -> list[tuple[int, str]]:
+        """返回章节选择弹窗可选项 [(chapter_num, label), ...]。"""
+        mode = self.mode_var.get()
+        items: list[tuple[int, str]] = []
+
+        if mode == "reschedule":
+            idx = self.cmb_book.current()
+            book_id = self.books[idx]["bookId"] if idx >= 0 and self.books else None
+            cache_key = self._chapter_cache_key(book_id) if book_id else None
+            platform_chapters = self._platform_chapters_cache.get(cache_key, []) if cache_key else []
+            source = [
+                ch for ch in reversed(platform_chapters)
+                if "待发布" in str(ch.get("status", "") or "")
+            ]
+            seen: set[int] = set()
+            for ch in source:
+                num = ch.get("chapterNum")
+                if num is None:
+                    continue
+                num = int(num)
+                if num in seen:
+                    continue
+                seen.add(num)
+                title = str(ch.get("title", "") or "").strip()
+                items.append((num, f"第{num}章  {title}" if title else f"第{num}章"))
+            return items
+
+        seen: set[int] = set()
+        for num, title, _ in self.parsed_chapters:
+            if num is None:
+                continue
+            ch_num = int(num)
+            if ch_num in seen:
+                continue
+            seen.add(ch_num)
+            title = str(title or "").strip()
+            items.append((ch_num, f"第{ch_num}章  {title}" if title else f"第{ch_num}章"))
+        return items
+
+    def _open_chapter_picker(self):
+        items = self._get_chapter_picker_items()
+        if not items:
+            messagebox.showinfo("提示", "当前没有可选择的章节。")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("选择章节")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("420x520")
+        win.minsize(360, 420)
+
+        ttk.Label(
+            win,
+            text="可多选。确认后会自动填入章节号筛选框。",
+            foreground=self.MUTED,
+        ).pack(fill="x", padx=12, pady=(12, 6))
+
+        frm = ttk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=12, pady=6)
+        lb = tk.Listbox(frm, selectmode=tk.EXTENDED, activestyle="dotbox")
+        sb = ttk.Scrollbar(frm, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        nums = [num for num, _ in items]
+        for _, label in items:
+            lb.insert(tk.END, label)
+
+        raw = unicodedata.normalize("NFKC", self.resched_filter_num_var.get()).strip()
+        try:
+            selector_kind, selector_value = parse_chapter_selector(raw) if raw else (None, None)
+        except ValueError:
+            selector_kind, selector_value = (None, None)
+        preselected: set[int] = set()
+        if selector_kind == "single":
+            preselected = {int(selector_value)}
+        elif selector_kind == "range":
+            lo, hi = selector_value
+            preselected = {n for n in nums if lo <= n <= hi}
+        elif selector_kind == "set":
+            preselected = set(int(n) for n in selector_value)
+        for idx, num in enumerate(nums):
+            if num in preselected:
+                lb.selection_set(idx)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def _select_all():
+            lb.selection_set(0, tk.END)
+
+        def _clear_all():
+            lb.selection_clear(0, tk.END)
+
+        def _confirm():
+            selected_idx = list(lb.curselection())
+            if not selected_idx:
+                messagebox.showwarning("提示", "请至少选择一个章节。", parent=win)
+                return
+            selected_nums = sorted({nums[i] for i in selected_idx})
+            self.resched_filter_var.set(True)
+            self.resched_filter_num_var.set(",".join(str(n) for n in selected_nums))
+            self._refresh_preview()
+            win.destroy()
+
+        ttk.Button(btns, text="全选", command=_select_all).pack(side="left")
+        ttk.Button(btns, text="清空", command=_clear_all).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text="确定", command=_confirm, style="Accent.TButton").pack(side="right", padx=(0, 6))
 
     def _refresh_reschedule_preview(self):
         """修改排期模式预览: 显示平台章节 + 计算的新排期。"""
@@ -2251,14 +2712,15 @@ class FanqieGUI:
         async def task():
             try:
                 url = NEW_CHAPTER_URL_TPL.format(book_id=book_id)
+                headless = bool(self._cfg.get("headless", False))
 
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=headless)
                     page = await context.new_page()
 
                     await page.goto(url)
                     try:
-                        await wait_for_editor_ready(page)
+                        await wait_for_editor_ready(page, prefer_continue_edit=False)
                     except PWTimeout:
                         logger.error("无法进入编辑器，请检查 Book ID 和登录状态。")
                         await browser.close()
@@ -2269,6 +2731,7 @@ class FanqieGUI:
                     failed = 0
                     total = len(files)
                     max_retries = self._cfg.get("max_retries", 2)
+                    daily_limit_notice = ""
 
                     for i in range(total):
                         if self._cancel_requested:
@@ -2289,7 +2752,7 @@ class FanqieGUI:
                             try:
                                 if i > 0 or attempt > 1:
                                     await page.goto(url)
-                                    await wait_for_editor_ready(page)
+                                    await wait_for_editor_ready(page, prefer_continue_edit=False)
 
                                 if target_volume:
                                     await select_editor_volume(page, target_volume)
@@ -2301,15 +2764,7 @@ class FanqieGUI:
                                     logger.info(f"  -> 定时发布 {d} {t}")
                                 elif mode == "publish":
                                     await _navigate_to_publish_settings(page, use_ai=use_ai)
-                                    btn = page.locator("button", has_text="确认发布")
-                                    if await btn.count() == 0:
-                                        raise RuntimeError("未找到确认发布按钮")
-                                    await btn.first.click(no_wait_after=True)
-                                    try:
-                                        await btn.first.wait_for(state="hidden", timeout=get_browser_timeout())
-                                    except Exception:
-                                        await page.wait_for_timeout(2000)
-                                    await _check_daily_limit(page)
+                                    await confirm_publish(page)
                                     logger.info("  -> 已发布")
                                 else:
                                     await save_draft(page)
@@ -2320,10 +2775,18 @@ class FanqieGUI:
 
                             except DailyLimitReached as e:
                                 logger.warning(f"{e}")
+                                logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
+                                daily_limit_notice = str(e)
                                 daily_limit = True
                                 break
 
                             except Exception as e:
+                                if is_daily_limit_exception(e):
+                                    daily_limit_notice = daily_limit_stop_message()
+                                    logger.warning(f"{daily_limit_notice}")
+                                    logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
+                                    daily_limit = True
+                                    break
                                 if attempt <= max_retries:
                                     logger.warning(f"第{attempt}次失败: {e}，重试中...")
                                     await page.wait_for_timeout(2000)
@@ -2353,6 +2816,14 @@ class FanqieGUI:
                     await save_auth(context)
                     await browser.close()
 
+                if daily_limit_notice:
+                    self._after(
+                        0,
+                        lambda msg=daily_limit_notice: messagebox.showwarning(
+                            "发布上限",
+                            msg,
+                        ),
+                    )
                 logger.info(f"{'='*40}")
                 logger.info(f"  上传完成! 成功: {success}  失败: {failed}")
                 logger.info(f"{'='*40}")
@@ -2414,13 +2885,15 @@ class FanqieGUI:
 
         async def task():
             try:
+                headless = bool(self._cfg.get("headless", False))
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=headless)
                     page = await context.new_page()
 
                     success = 0
                     failed = 0
                     total = len(matched_copy)
+                    daily_limit_notice = ""
 
                     for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched_copy):
                         if self._cancel_requested:
@@ -2429,19 +2902,9 @@ class FanqieGUI:
 
                         logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
-                        edit_url = plat_ch.get("editUrl")
-                        if not edit_url:
-                            logger.error("无法获取编辑链接，跳过")
-                            failed += 1
-                            self._after(0, self._update_progress, i + 1, total)
-                            continue
-
-                        if edit_url.startswith("/"):
-                            edit_url = BASE_URL + edit_url
-
                         try:
                             if await edit_one_chapter(
-                                    page, edit_url, ch_num, title, content,
+                                    page, book_id, plat_ch, ch_num, title, content,
                                     use_ai=use_ai,
                                     max_retries=self._cfg.get("max_retries", 2)):
                                 success += 1
@@ -2449,6 +2912,8 @@ class FanqieGUI:
                                 failed += 1
                         except DailyLimitReached as e:
                             logger.warning(f"{e}")
+                            logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
+                            daily_limit_notice = str(e)
                             failed += 1
                             break
 
@@ -2460,6 +2925,14 @@ class FanqieGUI:
                     await save_auth(context)
                     await browser.close()
 
+                if daily_limit_notice:
+                    self._after(
+                        0,
+                        lambda msg=daily_limit_notice: messagebox.showwarning(
+                            "发布上限",
+                            msg,
+                        ),
+                    )
                 logger.info(f"{'='*40}")
                 logger.info(f"  修改完成! 成功: {success}  失败: {failed}")
                 logger.info(f"{'='*40}")
@@ -2566,8 +3039,9 @@ class FanqieGUI:
 
         async def task():
             try:
+                headless = bool(self._cfg.get("headless", False))
                 async with async_playwright() as p:
-                    browser, context = await create_context(p, headless=False)
+                    browser, context = await create_context(p, headless=headless)
                     page = await context.new_page()
 
                     success, failed = await reschedule_on_manage_page(

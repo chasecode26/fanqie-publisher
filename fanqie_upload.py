@@ -24,10 +24,54 @@ import json
 import re
 import sys
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import logging
 from logging.handlers import RotatingFileHandler
+from urllib.parse import parse_qsl, urlencode, urlparse
+
+from fanqie_core.daily_limit import (
+    DAILY_LIMIT_HINTS as _DAILY_LIMIT_HINTS,
+    DailyLimitReached,
+    daily_limit_stop_message,
+    is_daily_limit_exception,
+    is_daily_limit_text,
+)
+from fanqie_core.chapter_match import match_chapters
+from fanqie_core.chapter_text import (
+    deduplicate_titles,
+    extract_chapter_num as _extract_chapter_num,
+    get_md_files,
+    parse_md_file,
+    strip_md_formatting,
+)
+from fanqie_core.schedule_rules import compute_schedule, validate_times as _validate_times
+from fanqie_core.volume_rules import (
+    resolve_new_chapter_volume,
+    resolve_volume_name,
+)
+from fanqie_web.js_snippets import (
+    BOOKS_JS,
+    DETECT_EDITOR_VOLUMES_JS,
+    DETECT_VOLUMES_JS,
+    LAST_PUBLISH_JS,
+    SELECT_EDITOR_VOLUME_JS,
+    SELECT_VOLUME_JS,
+)
+from fanqie_web.volume_ops import (
+    detect_editor_volumes as _detect_editor_volumes_impl,
+    detect_volumes as _detect_volumes_impl,
+    select_editor_volume as _select_editor_volume_impl,
+    select_volume as _select_volume_impl,
+)
+from fanqie_web.manage_ops import (
+    click_manage_row_action as _click_manage_row_action_impl,
+    go_to_manage_page_number as _go_to_manage_page_number_impl,
+    go_to_next_manage_page as _go_to_next_manage_page_impl,
+    resolve_edit_url_from_manage as _resolve_edit_url_from_manage_impl,
+    scan_manage_row as _scan_manage_row_impl,
+    wait_manage_table_ready as _wait_manage_table_ready_impl,
+)
 
 try:
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -99,16 +143,16 @@ def setup_logging(log_file=None, level=logging.INFO):
         logger.addHandler(fh)
 
 
-class DailyLimitReached(RuntimeError):
-    """当日发布字数已达平台上限，无法继续发布。"""
-
-
 async def _check_daily_limit(page):
     """检测平台"当日发布字数上限"提示，若存在则抛出 DailyLimitReached。"""
     try:
-        tip = page.locator("text=已到达当日发布字数上限")
-        if await tip.count() > 0:
-            raise DailyLimitReached("已到达当日发布字数上限，无法继续发布")
+        body_text = await page.evaluate("() => document.body?.innerText || ''")
+        if is_daily_limit_text(body_text):
+            raise DailyLimitReached(daily_limit_stop_message())
+        for hint in _DAILY_LIMIT_HINTS:
+            tip = page.locator(f"text={hint}")
+            if await tip.count() > 0:
+                raise DailyLimitReached(daily_limit_stop_message())
     except DailyLimitReached:
         raise
     except Exception:
@@ -140,258 +184,94 @@ def get_browser_timeout() -> int:
     return _browser_timeout
 
 
-# ---------------------------------------------------------------------------
-# MD 文件解析
-# ---------------------------------------------------------------------------
-def natural_sort_key(path: Path):
-    """自然排序: 001 < 2 < 10"""
-    return [
-        int(s) if s.isdigit() else s.lower()
-        for s in re.split(r"(\d+)", path.name)
-    ]
+def _looks_like_chapter_api(url: str) -> bool:
+    low = (url or "").lower()
+    if not any(k in low for k in ("chapter", "catalog", "directory", "list", "page")):
+        return False
+    return any(k in low for k in ("author", "writer", "fanqie", "novel"))
 
 
-_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
-               "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
-               "十": 10, "百": 100, "千": 1000}
+def attach_chapter_network_logger(page, *, tag: str = ""):
+    """记录章节管理页相关 XHR/Fetch 响应，便于定位真实数据接口。"""
+    if not hasattr(page, "_chapter_api_cache"):
+        page._chapter_api_cache = {}
+    if not hasattr(page, "_volume_name_to_id"):
+        page._volume_name_to_id = {}
 
-
-def _cn_to_int(cn: str) -> int:
-    """中文数字转阿拉伯数字: 十六->16, 一百二十三->123, 二十->20"""
-    result, current = 0, 0
-    for ch in cn:
-        val = _CN_DIGITS.get(ch)
-        if val is None:
-            return 0
-        if val >= 10:  # 十百千
-            if current == 0:
-                current = 1
-            result += current * val
-            current = 0
-        else:
-            current = val
-    result += current
-    return result
-
-
-def _extract_chapter_num(text: str) -> str | None:
-    """
-    从文本中提取章节号（纯数字字符串）。
-
-    支持格式（前导零自动去除）:
-        "001_标题"           -> "1"
-        "046_标题"           -> "46"
-        "第27章_标题"        -> "27"
-        "第 27 章 标题"      -> "27"
-        "第十六章 发布会"    -> "16"
-        "第一百二十三章 标题" -> "123"
-        "第27回 黛玉葬花"    -> "27"
-        "第十六话 出发"      -> "16"
-        "chapter-027"        -> "27"
-        "Chapter 3 - Title"  -> "3"
-    """
-    # 1) 纯数字开头: 001_xxx, 027 xxx
-    m = re.match(r"^(\d+)", text)
-    if m:
-        return str(int(m.group(1)))
-    # 2) 第X章/回/节/话 - 阿拉伯数字: 第27章, 第 27 章, 第27回
-    m = re.match(r"^第\s*(\d+)\s*[章回节话]", text)
-    if m:
-        return str(int(m.group(1)))
-    # 3) 第X章/回/节/话 - 中文数字: 第十六章, 第一百二十三回
-    m = re.match(r"^第([零〇一二两三四五六七八九十百千]+)[章回节话]", text)
-    if m:
-        num = _cn_to_int(m.group(1))
-        if num > 0:
-            return str(num)
-    # 4) chapter-027, Chapter 3
-    m = re.match(r"^chapter[_\-\s]*(\d+)", text, re.IGNORECASE)
-    if m:
-        return str(int(m.group(1)))
-    return None
-
-
-def _strip_chapter_prefix(text: str) -> str:
-    """
-    去掉标题中的章节号前缀，只保留标题文字。
-
-    "第 27 章 重新开始"  -> "重新开始"
-    "第27章重新开始"      -> "重新开始"
-    "第27回 黛玉葬花"    -> "黛玉葬花"
-    "第十六话 出发"      -> "出发"
-    "001 新的旅程"        -> "新的旅程"
-    "001：新的旅程"       -> "新的旅程"
-    "chapter-3 出发"      -> "出发"
-    "Chapter 3 - Hello"  -> "Hello"
-    """
-    original = text.strip()
-    patterns = [
-        r"^第\s*\d+\s*[章回节话][\s:：_\-]*",     # 第 27 章 / 第27章 / 第27回
-        r"^第[零〇一二两三四五六七八九十百千]+[章回节话][\s:：_\-]*",  # 第十六章 / 第一百二十三回
-        r"^\d+[\s:：_\-]+",                        # 001_xxx / 001:标题 / 001：标题
-        r"^chapter[\s_\-]*\d+[\s_\-]*",            # chapter-3 / Chapter 3 -
-    ]
-    for pat in patterns:
-        cleaned = re.sub(pat, "", original, flags=re.IGNORECASE).strip()
-        if cleaned and cleaned != original:
-            return cleaned
-    return original
-
-
-def parse_md_file(fp: Path) -> tuple:
-    """
-    解析 MD 文件，返回 (chapter_num, title, content)。
-
-    章节号提取优先级: 文件名 > 标题中 "第X章"
-    标题提取优先级:  第一个 # 标题(去前缀) > 文件名(去前缀)
-
-    支持的文件名:
-        001_标题.md / 第27章.md / chapter-027.md / 第 3 章 出发.md
-
-    支持的 # 标题:
-        # 第 27 章 重新开始 / # 重新开始 / # 001 新的旅程
-    """
-    try:
-        text = fp.read_text(encoding="utf-8-sig").strip()
-    except UnicodeDecodeError:
-        text = fp.read_text(encoding="gbk", errors="replace").strip()
-        if "\ufffd" in text:
-            logger.warning(f"{fp.name}: 编码异常，部分内容可能损坏")
-    lines = text.split("\n")
-
-    heading = None      # 原始 # 标题
-    content_start = 0
-
-    # 从第一个 # heading 提取标题
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            heading = stripped[2:].strip()
-            content_start = i + 1
-            break
-
-    content = "\n".join(lines[content_start:]).strip()
-
-    # ---- 提取章节号 ----
-    # 优先从文件名提取
-    chapter_num = _extract_chapter_num(fp.stem)
-    # 其次从 heading 提取
-    if chapter_num is None and heading:
-        chapter_num = _extract_chapter_num(heading)
-
-    # ---- 提取标题 ----
-    if heading:
-        title = _strip_chapter_prefix(heading)
-    else:
-        title = _strip_chapter_prefix(fp.stem)
-
-    # 兜底
-    if not title:
-        title = fp.stem
-
-    return chapter_num, title, content
-
-
-def get_md_files(directory: Path) -> list:
-    exts = (".md", ".txt")
-    files: list[Path] = []
-    subdirs: list[Path] = []
-    for item in directory.iterdir():
-        if item.is_dir():
-            subdirs.append(item)
-        elif item.is_file() and item.suffix.lower() in exts:
-            files.append(item)
-    files.sort(key=natural_sort_key)
-    # 子文件夹中的文件也视为有效章节
-    subdirs.sort(key=natural_sort_key)
-    for sub in subdirs:
+    async def _log_response(resp):
         try:
-            sub_files = [f for f in sub.iterdir()
-                         if f.is_file() and f.suffix.lower() in exts]
-        except OSError:
-            logger.warning(f"无法访问子文件夹: {sub.name}")
-            continue
-        sub_files.sort(key=natural_sort_key)
-        files.extend(sub_files)
-    return files
+            req = resp.request
+            if req.resource_type not in ("xhr", "fetch"):
+                return
+            url = resp.url
+            if not _looks_like_chapter_api(url):
+                return
+            parsed = urlparse(url)
+            qs = dict(parse_qsl(parsed.query))
+            body = None
+            ctype = (resp.headers or {}).get("content-type", "")
+            if "json" in ctype:
+                try:
+                    body = await resp.json()
+                except Exception:
+                    body = await resp.text()
+            else:
+                body = await resp.text()
+            preview = body
+            if isinstance(body, dict):
+                preview = {
+                    "keys": list(body.keys())[:12],
+                    "code": body.get("code"),
+                    "message": body.get("message") or body.get("msg"),
+                    "data_keys": list((body.get("data") or {}).keys())[:12] if isinstance(body.get("data"), dict) else None,
+                }
+                path = parsed.path
+                if "/api/author/chapter/chapter_list/" in path:
+                    page_index = int(qs.get("page_index", "0") or 0)
+                    volume_id = str(qs.get("volume_id", "") or "")
+                    page._chapter_api_cache[(volume_id, page_index)] = {
+                        "qs": qs,
+                        "body": body,
+                    }
+                    items = (((body.get("data") or {}).get("item_list")) or [])
+                    if items and isinstance(items[0], dict):
+                        preview["item_keys"] = list(items[0].keys())[:20]
+                        preview["item_status_sample"] = {
+                            k: items[0].get(k)
+                            for k in items[0].keys()
+                            if "status" in str(k).lower()
+                        }
+                elif "/api/author/volume/volume_list/" in path:
+                    volumes = (((body.get("data") or {}).get("volume_list")) or [])
+                    for vol in volumes:
+                        if not isinstance(vol, dict):
+                            continue
+                        vid = str(
+                            vol.get("volume_id")
+                            or vol.get("id")
+                            or vol.get("item_id")
+                            or ""
+                        )
+                        name = str(
+                            vol.get("volume_name")
+                            or vol.get("title")
+                            or vol.get("name")
+                            or ""
+                        ).strip()
+                        if vid and name:
+                            page._volume_name_to_id[name] = vid
+                    if volumes and isinstance(volumes[0], dict):
+                        preview["volume_item_keys"] = list(volumes[0].keys())[:20]
+            logger.info(
+                f"[NET{':' + tag if tag else ''}] {resp.status} {parsed.path} qs={qs} preview={str(preview)[:500]}"
+            )
+        except Exception as e:
+            logger.debug(f"网络日志记录失败: {e}")
 
+    def _on_response(resp):
+        asyncio.create_task(_log_response(resp))
 
-def strip_md_formatting(text: str) -> str:
-    """去掉 Markdown 格式标记，保留纯文本段落。"""
-    # 移除图片
-    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
-    # 移除链接，保留文字
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    # 移除加粗/斜体
-    text = re.sub(r"\*{1,3}(.*?)\*{1,3}", r"\1", text)
-    text = re.sub(r"_{1,3}(.*?)_{1,3}", r"\1", text)
-    # 移除删除线
-    text = re.sub(r"~~(.*?)~~", r"\1", text)
-    # 移除标题标记
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # 移除引用标记
-    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
-    # 移除分隔线
-    text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    # 移除代码块标记
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
-    text = re.sub(r"`([^`]*)`", r"\1", text)
-    # 移除 HTML 注释
-    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    # 移除 HTML 标签
-    text = re.sub(r"<[^>]+>", "", text)
-    # 移除任务列表标记 (- [ ] / - [x]，须在普通列表标记之前处理)
-    text = re.sub(r"^\s*[-*+]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*\d+[.)]\s+\[[ xX]\]\s*", "", text, flags=re.MULTILINE)
-    # 移除无序列表标记 (- / * / + 开头)
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
-    # 移除有序列表标记 (1. / 2) 等)
-    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.MULTILINE)
-    # 合并连续空行为单个空行
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def deduplicate_titles(
-    parsed_chapters: list[tuple[str | None, str, str]],
-) -> list[tuple[str | None, str, str]]:
-    """
-    检测并处理重复标题。
-
-    对于重复的标题，追加章节号后缀使其唯一:
-      "选择" (第33章) -> "选择（33）"
-      "选择" (第39章) -> "选择（39）"
-
-    如果没有章节号，则追加序号:
-      "选择" (无章节号, 第2个) -> "选择（2）"
-
-    不重复的标题不做任何修改。
-    """
-    # 统计标题出现次数
-    title_counts = Counter(title for _, title, _ in parsed_chapters)
-    dup_titles = {t for t, c in title_counts.items() if c > 1}
-
-    if not dup_titles:
-        return parsed_chapters
-
-    # 给重复的标题加后缀
-    # used 跟踪所有已使用的标题，防止后缀后仍然碰撞
-    used: set[str] = {t for _, t, _ in parsed_chapters if t not in dup_titles}
-    seen: dict[str, int] = {}
-    result = []
-    for chapter_num, title, content in parsed_chapters:
-        if title not in dup_titles:
-            result.append((chapter_num, title, content))
-            continue
-        suffix = chapter_num if chapter_num else str(seen.get(title, 1))
-        new_title = f"{title}（{suffix}）"
-        seen[title] = seen.get(title, 1) + 1
-        while new_title in used:
-            new_title = f"{title}（{seen[title]}）"
-            seen[title] += 1
-        used.add(new_title)
-        result.append((chapter_num, new_title, content))
-    return result
+    page.on("response", _on_response)
 
 
 # ---------------------------------------------------------------------------
@@ -420,26 +300,52 @@ async def save_auth(context):
     await context.storage_state(path=str(AUTH_FILE))
 
 
-async def dismiss_overlays(page):
-    """
-    关闭可能遮挡按钮的弹窗:
-      1. "提示" 草稿恢复弹窗 -> 点 "放弃"
-      2. React Tour 新手引导  -> 用 JS 直接移除
-    注意: fill_chapter 已改用 page.evaluate 操作 DOM，不受弹窗影响。
-          此函数主要确保 "存草稿"/"下一步" 等按钮可以被 Playwright 点击。
-    """
-    await page.wait_for_timeout(800)
+async def dismiss_overlays(page, *, prefer_continue_edit: bool = True):
+    """关闭可能遮挡按钮的弹窗。返回处理到的动作标签。"""
+    await page.wait_for_timeout(500)
+    handled_label = ""
 
-    # 1. 草稿恢复弹窗: "有刚刚更新的草稿，是否继续编辑？" -> 放弃
+    # 1. “是否继续编辑”弹窗：已进入目标正文编辑页时应优先继续编辑。
     try:
-        draft_hint = page.locator("text=是否继续编辑")
-        if await draft_hint.count() > 0:
-            abandon_btn = page.locator("button", has_text="放弃")
-            if await abandon_btn.count() > 0:
-                await abandon_btn.first.click()
-                await page.wait_for_timeout(800)
-    except Exception:
-        pass
+        dialog_text = page.locator("text=是否继续编辑").first
+        if await dialog_text.count() > 0 and await dialog_text.is_visible():
+            logger.info("检测到“是否继续编辑”弹窗，尝试关闭")
+
+            clicked = False
+            labels = ("继续编辑", "取消", "放弃") if prefer_continue_edit else ("取消", "放弃", "继续编辑")
+            for label in labels:
+                btn = page.locator("button", has_text=label)
+                if await btn.count() == 0:
+                    btn = page.locator("[role='button']", has_text=label)
+                if await btn.count() == 0:
+                    btn = page.locator(f"text={label}")
+                if await btn.count() == 0:
+                    continue
+
+                try:
+                    await btn.first.click(force=True)
+                    logger.info(f"已点击弹窗按钮: {label}")
+                    handled_label = label
+                    clicked = True
+                    break
+                except Exception as e:
+                    logger.debug(f"点击“{label}”失败，继续尝试其他按钮: {e}")
+
+            if clicked:
+                try:
+                    await dialog_text.wait_for(state="hidden", timeout=3000)
+                    logger.info("“是否继续编辑”弹窗已关闭")
+                except Exception:
+                    await page.wait_for_timeout(1000)
+                    still_visible = (
+                        await dialog_text.count() > 0 and await dialog_text.is_visible()
+                    )
+                    if still_visible:
+                        logger.warning("“是否继续编辑”弹窗点击后仍可见")
+            else:
+                logger.warning("检测到“是否继续编辑”弹窗，但未找到可点击的“继续编辑/取消/放弃”按钮")
+    except Exception as e:
+        logger.debug(f"关闭“是否继续编辑”弹窗失败: {e}")
 
     # 2. React Tour 新手引导 -> 直接用 JS 移除 DOM 节点（比逐步点击更可靠）
     try:
@@ -456,9 +362,91 @@ async def dismiss_overlays(page):
         }""")
     except Exception:
         pass
+    return handled_label
 
 
-async def wait_for_editor_ready(page, timeout=None):
+def _normalize_ui_text(text: str | None) -> str:
+    return " ".join(str(text or "").split()).strip()
+
+
+async def _click_visible_action(
+    page,
+    labels: str | list[str] | tuple[str, ...],
+    *,
+    wait_ms: int = 800,
+) -> str:
+    """按可见文案点击动作按钮，兼容 button / role=button / Arco 按钮。"""
+    if isinstance(labels, str):
+        labels = [labels]
+    labels = [_normalize_ui_text(label) for label in labels if _normalize_ui_text(label)]
+    if not labels:
+        return ""
+
+    clicked = await page.evaluate(
+        """(labels) => {
+            const normalize = (text) => String(text || '').split(/\\s+/).filter(Boolean).join(' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const candidates = Array.from(document.querySelectorAll(
+                'button, [role="button"], .arco-btn, .semi-button'
+            )).filter(visible);
+
+            for (const label of labels) {
+                const exact = candidates.find((el) => normalize(el.innerText || el.textContent || '') === label);
+                if (exact) {
+                    exact.click();
+                    return label;
+                }
+            }
+            for (const label of labels) {
+                const fuzzy = candidates.find((el) => normalize(el.innerText || el.textContent || '').includes(label));
+                if (fuzzy) {
+                    fuzzy.click();
+                    return label;
+                }
+            }
+            return '';
+        }""",
+        labels,
+    )
+    if clicked:
+        await page.wait_for_timeout(wait_ms)
+    return str(clicked or "")
+
+
+async def confirm_publish(page, *, labels: tuple[str, ...] = ("确认发布", "定时发布", "发布")):
+    """确认发布/定时发布，并等待发布弹窗关闭。"""
+    await _check_daily_limit(page)
+    clicked_label = await _click_visible_action(page, list(labels), wait_ms=300)
+    if not clicked_label:
+        state = await get_publish_flow_state(page)
+        raise RuntimeError(
+            f"未找到确认发布按钮 | {_format_publish_flow_state(state)}"
+        )
+
+    dialog_closed = False
+    for _ in range(12):
+        await page.wait_for_timeout(400)
+        state = await get_publish_flow_state(page)
+        if not state.get("hasPublishSettings"):
+            dialog_closed = True
+            break
+        if state.get("hasContinueEdit") or state.get("hasSubmitConfirm") or state.get("hasRiskDialog"):
+            dialog_closed = True
+            break
+    if not dialog_closed:
+        await page.wait_for_timeout(2000)
+
+    await _check_daily_limit(page)
+    logger.info(f"  -> 已点击{clicked_label}")
+
+
+async def wait_for_editor_ready(page, timeout=None, *, prefer_continue_edit: bool = True):
     """等待章节编辑器加载完成。"""
     if timeout is None:
         timeout = _browser_timeout
@@ -469,7 +457,7 @@ async def wait_for_editor_ready(page, timeout=None):
     await page.wait_for_selector("input[placeholder='请输入标题']", timeout=timeout)
     await page.wait_for_timeout(500)
     # 关闭弹窗/引导层
-    await dismiss_overlays(page)
+    await dismiss_overlays(page, prefer_continue_edit=prefer_continue_edit)
 
 
 async def _get_word_count(page) -> int:
@@ -623,558 +611,799 @@ async def clear_editor(page):
     await page.wait_for_timeout(500)
 
 
+async def inspect_editor_prefill(page) -> dict:
+    """读取当前编辑页预填信息，判断是否真的进入已有章节编辑。"""
+    return await page.evaluate("""() => {
+        const titleInput = document.querySelector('input[placeholder="请输入标题"]');
+        const title = titleInput ? (titleInput.value || '').trim() : '';
+        let chapterNum = '';
+        for (const inp of document.querySelectorAll('input')) {
+            if (inp.type === 'text'
+                && inp.placeholder !== '请输入标题'
+                && inp.offsetParent !== null) {
+                chapterNum = (inp.value || '').trim();
+                break;
+            }
+        }
+        const editor = document.querySelector('.ProseMirror');
+        const contentText = editor ? (editor.innerText || '').trim() : '';
+        return {
+            title,
+            chapterNum,
+            contentLength: contentText.length,
+            hasContent: contentText.length > 0,
+        };
+    }""")
+
+
+async def _settle_editor_before_publish(page):
+    """让编辑器失焦，给平台一点时间完成内部状态同步。"""
+    try:
+        await page.evaluate("""() => {
+            const active = document.activeElement;
+            if (active && typeof active.blur === 'function') {
+                active.blur();
+            }
+            const editor = document.querySelector('.ProseMirror');
+            if (editor) {
+                editor.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+            document.body?.click?.();
+        }""")
+    except Exception:
+        pass
+    await page.wait_for_timeout(300)
+
+
+async def _get_next_step_button_state(page) -> dict:
+    """获取当前最像主操作的“下一步”按钮状态。"""
+    try:
+        return await page.evaluate("""() => {
+            const norm = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const candidates = Array.from(document.querySelectorAll('button.auto-editor-next, button, [role="button"]'))
+                .filter((el) => visible(el) && norm(el.innerText || el.textContent || '').includes('下一步'));
+            const pickScore = (el) => {
+                const rect = el.getBoundingClientRect();
+                const primary = (el.className || '').includes('auto-editor-next') ? 1000000 : 0;
+                const enabled = (!el.disabled
+                    && el.getAttribute('aria-disabled') !== 'true'
+                    && !el.classList.contains('disabled')) ? 100000 : 0;
+                return primary + enabled + Math.round(rect.bottom * 10) + Math.round(rect.width * rect.height);
+            };
+            const best = candidates.slice().sort((a, b) => pickScore(b) - pickScore(a))[0] || null;
+            const hints = Array.from(document.querySelectorAll(
+                '.arco-form-item-message, .arco-form-item-explain, .byte-form-item-message, .byte-form-item-explain, [class*="error"], [class*="warning"]'
+            ))
+                .filter(visible)
+                .map((el) => norm(el.innerText || el.textContent || ''))
+                .filter(Boolean)
+                .slice(0, 8);
+            return {
+                found: !!best,
+                totalMatches: candidates.length,
+                text: best ? norm(best.innerText || best.textContent || '') : '',
+                disabled: !!best && (
+                    !!best.disabled
+                    || best.getAttribute('aria-disabled') === 'true'
+                    || best.classList.contains('disabled')
+                ),
+                className: best ? (best.className || '') : '',
+                hints,
+            };
+        }""")
+    except Exception as e:
+        return {"found": False, "error": str(e), "hints": []}
+
+
+def _format_publish_flow_state(state: dict) -> str:
+    if not state:
+        return "[empty]"
+    if state.get("error"):
+        return f"error={state['error']}"
+    parts = [
+        f"editor={'Y' if state.get('editorVisible') else 'N'}",
+        f"next={'Y' if state.get('hasNextStep') else 'N'}",
+        f"publish={'Y' if state.get('hasPublishSettings') else 'N'}",
+    ]
+    if state.get("hasNextStep"):
+        parts.append(f"nextDisabled={'Y' if state.get('nextStepDisabled') else 'N'}")
+        if state.get("nextStepCount", 0) > 1:
+            parts.append(f"nextCount={state.get('nextStepCount')}")
+    flags = []
+    if state.get("hasContinueEdit"):
+        flags.append("continue")
+    if state.get("hasSubmitConfirm"):
+        flags.append("submit")
+    if state.get("hasRiskDialog"):
+        flags.append("risk")
+    if state.get("hasIgnoreAll"):
+        flags.append("ignore")
+    if flags:
+        parts.append("flags=" + ",".join(flags))
+    if state.get("dialogTitles"):
+        parts.append("dialogs=" + " | ".join(state["dialogTitles"][:3]))
+    if state.get("visibleButtons"):
+        parts.append("buttons=" + " | ".join(state["visibleButtons"][:6]))
+    return " | ".join(parts)
+
+
+async def log_publish_flow_state(page, stage: str) -> dict:
+    state = await get_publish_flow_state(page)
+    logger.info(f"  流程状态[{stage}]: {_format_publish_flow_state(state)}")
+    return state
+
+
+def _is_same_publish_flow_state(a: dict | None, b: dict | None) -> bool:
+    if not a or not b:
+        return False
+    keys = (
+        "editorVisible",
+        "hasNextStep",
+        "hasPublishSettings",
+        "hasContinueEdit",
+        "hasSubmitConfirm",
+        "hasRiskDialog",
+        "hasIgnoreAll",
+    )
+    if any(a.get(k) != b.get(k) for k in keys):
+        return False
+    return (
+        (a.get("dialogTitles") or [])[:3] == (b.get("dialogTitles") or [])[:3]
+        and (a.get("visibleButtons") or [])[:6] == (b.get("visibleButtons") or [])[:6]
+    )
+
+
+async def get_publish_flow_state(page) -> dict:
+    """采集编辑到发布设置之间的页面状态，便于日志诊断。"""
+    try:
+        return await page.evaluate("""() => {
+            const norm = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const takeTexts = (selector, limit = 8) => Array.from(document.querySelectorAll(selector))
+                .filter(visible)
+                .map((el) => norm(el.innerText || el.textContent || ''))
+                .filter(Boolean)
+                .slice(0, limit);
+            const visibleButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+                .filter(visible)
+                .map((el) => norm(el.innerText || el.textContent || ''))
+                .filter(Boolean)
+                .slice(0, 10);
+            const bodyText = document.body.innerText || '';
+            const nextBtns = Array.from(document.querySelectorAll('button.auto-editor-next, button, [role="button"]'))
+                .filter((el) => visible(el) && norm(el.innerText || el.textContent || '').includes('下一步'));
+            const pickScore = (el) => {
+                const rect = el.getBoundingClientRect();
+                const primary = (el.className || '').includes('auto-editor-next') ? 1000000 : 0;
+                const enabled = (!el.disabled
+                    && el.getAttribute('aria-disabled') !== 'true'
+                    && !el.classList.contains('disabled')) ? 100000 : 0;
+                return primary + enabled + Math.round(rect.bottom * 10) + Math.round(rect.width * rect.height);
+            };
+            const nextBtn = nextBtns.slice().sort((a, b) => pickScore(b) - pickScore(a))[0] || null;
+            const editor = document.querySelector('.ProseMirror');
+            return {
+                editorVisible: visible(editor),
+                editorTextLength: editor ? norm(editor.innerText || '').length : 0,
+                hasNextStep: !!nextBtn,
+                nextStepText: nextBtn ? norm(nextBtn.innerText || nextBtn.textContent || '') : '',
+                nextStepDisabled: !!nextBtn && (
+                    !!nextBtn.disabled
+                    || nextBtn.getAttribute('aria-disabled') === 'true'
+                    || nextBtn.classList.contains('disabled')
+                ),
+                nextStepCount: nextBtns.length,
+                hasPublishSettings: bodyText.includes('发布设置')
+                    || bodyText.includes('是否使用AI')
+                    || visibleButtons.some((t) => ['确认发布', '定时发布'].includes(t)),
+                hasContinueEdit: bodyText.includes('是否继续编辑'),
+                hasSubmitConfirm: bodyText.includes('是否确定提交') || bodyText.includes('发布提示'),
+                hasRiskDialog: bodyText.includes('是否进行内容风险检测'),
+                hasIgnoreAll: visibleButtons.some((t) => ['忽略全部', '全部忽略', '暂不处理', '关闭', '我知道了', '知道了'].includes(t)),
+                dialogTitles: takeTexts('[role="dialog"] h1, [role="dialog"] h2, [role="dialog"] h3, .arco-modal-title, .semi-modal-title, .semi-drawer-title', 6),
+                sidePanelTexts: takeTexts('[class*="drawer"], [class*="panel"], [class*="modal"], [class*="dialog"]', 6),
+                visibleButtons,
+            };
+        }""")
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # JS: 获取作品列表（CLI 和 GUI 共用）
 # ---------------------------------------------------------------------------
-BOOKS_JS = r"""() => {
-    const results = [];
-    const links = document.querySelectorAll('a[href*="chapter-manage/"]');
-    for (const link of links) {
-        const href = link.getAttribute('href') || '';
-        const m = href.match(/chapter-manage\/(\d+)(?:&([^?]*))?/);
-        if (!m) continue;
-        const bookId = m[1];
-        let name;
-        if (m[2]) {
-            try { name = decodeURIComponent(m[2]); }
-            catch { name = m[2]; }
-        } else {
-            name = '';
-        }
-        let container = link;
-        for (let i = 0; i < 12; i++) {
-            if (!container.parentElement) break;
-            container = container.parentElement;
-            const ct = container.textContent || '';
-            if (ct.length > 30 &&
-                (ct.includes('万字') || /\d+\s*章/.test(ct))) break;
-        }
-        const text = container.textContent || '';
-        const chapterMatch = text.match(/(\d+)\s*章/);
-        const wordMatch = text.match(/([\d.]+)\s*万字/);
-        const statusMatch = text.match(/(连载中|已完结)/);
-        const signMatch = text.match(/(已签约|未签约)/);
-        if (!name) {
-            const linkText = link.textContent.trim();
-            if (linkText) name = linkText;
-            else name = '未命名作品';
-        }
-        results.push({
-            bookId, name,
-            chapters: chapterMatch ? chapterMatch[1] : '0',
-            words: wordMatch ? wordMatch[1] + '万' : '0',
-            status: (statusMatch ? statusMatch[1] : '') +
-                    (signMatch ? ' · ' + signMatch[1] : ''),
-        });
-    }
-    return results;
-}"""
 
 
 # ---------------------------------------------------------------------------
 # JS: 从章节管理页提取最新一条发布时间（仅当前页，不翻页）
 # ---------------------------------------------------------------------------
-LAST_PUBLISH_JS = r"""() => {
-    const re = /(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2})/;
-    let best = null, bestKey = '';
-    for (const row of document.querySelectorAll('tr')) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 2) continue;
-        const m = row.textContent.match(re);
-        if (!m) continue;
-        const d = m[1].replace(/\//g, '-');
-        const t = m[2];
-        const key = d + ' ' + t;
-        if (key > bestKey) {
-            best = {date: d, time: t, chapter: cells[0].textContent.trim()};
-            bestKey = key;
-        }
-    }
-    return best;
-}"""
 
 
 # ---------------------------------------------------------------------------
-# 章节列表提取（修改模式用）— 单次 JS 调用完成全部翻页
+# 章节列表提取（修改模式用）— 当前页提取
 # ---------------------------------------------------------------------------
-_EXTRACT_ALL_JS = r"""async (opts) => {
-    const WAIT_TIMEOUT = (opts && opts.waitTimeout) || 10000;
-    const MAX_TIME = (opts && opts.maxTime) || 120000;
-
-    // 等待表格出现
-    const t0 = Date.now();
-    while (!document.querySelector('tr td')) {
-        if (Date.now() - t0 > WAIT_TIMEOUT) break;
-        await new Promise(r => requestAnimationFrame(r));
-    }
-
-    const allChapters = [];
-    const seenKeys = new Set();
-    let totalPages = 0;
-    let pageCount = 0;
-
-    // 同时提取最新发布时间
+EXTRACT_CURRENT_PAGE_JS = r"""() => {
     const dateRe = /(\d{4}[-\/]\d{2}[-\/]\d{2})\s+(\d{2}:\d{2})/;
+    const chapters = [];
     let lastPub = null;
     let lastPubKey = '';
 
-    // 获取总页数
-    for (const li of document.querySelectorAll('li.arco-pagination-item')) {
-        const n = parseInt(li.textContent);
-        if (!isNaN(n) && n > totalPages) totalPages = n;
-    }
+    for (const row of document.querySelectorAll('tr')) {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 2) continue;
+        const title = cells[0].textContent.trim();
+        if (!title) continue;
 
-    const start = Date.now();
-
-    for (let i = 0; i < 500 && Date.now() - start < MAX_TIME; i++) {
-        let newCount = 0;
-        for (const row of document.querySelectorAll('tr')) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 2) continue;
-            const title = cells[0].textContent.trim();
-            if (!title) continue;
-
-            // 编辑链接
-            let editUrl = null;
-            for (const a of row.querySelectorAll('a')) {
-                const href = a.getAttribute('href') || '';
-                if (/\/publish\//.test(href) || /chapter_id/.test(href)) {
-                    editUrl = href; break;
-                }
-                const text = a.textContent.trim();
-                if (text === '编辑' || text === '修改') {
-                    editUrl = href; break;
-                }
+        let editUrl = null;
+        for (const a of row.querySelectorAll('a')) {
+            const href = a.getAttribute('href') || '';
+            if (/\/publish\//.test(href) || /chapter_id/.test(href)) {
+                editUrl = href; break;
             }
-
-            // 章节号
-            let chapterNum = null;
-            let m = title.match(/^第\s*(\d+)\s*[章回节话]/);
-            if (m) chapterNum = parseInt(m[1], 10);
-            else { m = title.match(/^(\d+)/); if (m) chapterNum = parseInt(m[1], 10); }
-
-            const key = chapterNum + '|' + title;
-            if (seenKeys.has(key)) continue;
-            seenKeys.add(key);
-
-            // 审核状态（待发布/已发布/审核中 等）
-            let status = '';
-            for (let ci = 1; ci < cells.length; ci++) {
-                const ct = cells[ci].textContent.trim();
-                if (/待发布|已发布|审核中|草稿|已拒绝/.test(ct)) {
-                    status = ct; break;
-                }
-            }
-
-            allChapters.push({ title, chapterNum, editUrl, status, rowIndex: allChapters.length });
-            newCount++;
-
-            // 发布日期
-            const dm = row.textContent.match(dateRe);
-            if (dm) {
-                const d = dm[1].replace(/\//g, '-');
-                const t = dm[2];
-                const pk = d + ' ' + t;
-                if (pk > lastPubKey) {
-                    lastPub = { date: d, time: t, chapter: title };
-                    lastPubKey = pk;
-                }
+            const text = a.textContent.trim();
+            if (text === '编辑' || text === '修改') {
+                editUrl = href; break;
             }
         }
 
-        pageCount++;
-        if (newCount === 0 && pageCount > 1) break;
+        let chapterNum = null;
+        let m = title.match(/^第\s*(\d+)\s*[章回节话]/);
+        if (m) chapterNum = parseInt(m[1], 10);
+        else { m = title.match(/^(\d+)/); if (m) chapterNum = parseInt(m[1], 10); }
 
-        // 下一页
-        let nextBtn = document.querySelector(
-            'li.arco-pagination-item-next:not(.arco-pagination-item-disabled)');
-        if (!nextBtn) {
-            nextBtn = document.querySelector(
-                "button[aria-label='next'], .next-page");
-            if (nextBtn && (nextBtn.disabled
-                || nextBtn.classList.contains('disabled'))) nextBtn = null;
+        let status = '';
+        for (let ci = 1; ci < cells.length; ci++) {
+            const ct = cells[ci].textContent.trim();
+            if (/待发布|已发布|审核中|草稿|已拒绝/.test(ct)) {
+                status = ct; break;
+            }
         }
-        if (!nextBtn) break;
 
-        const firstTitle = document.querySelector('tr td')?.textContent?.trim() || '';
-        nextBtn.click();
+        chapters.push({ title, chapterNum, editUrl, status });
 
-        // RAF 轮询等待表格变化（~60fps, 零 IPC 开销）
-        await new Promise(resolve => {
-            const deadline = Date.now() + 8000;
-            (function check() {
-                const c = document.querySelector('tr td')?.textContent?.trim() || '';
-                if ((c && c !== firstTitle) || Date.now() > deadline) {
-                    resolve(); return;
-                }
-                requestAnimationFrame(check);
-            })();
-        });
+        const dm = row.textContent.match(dateRe);
+        if (dm) {
+            const d = dm[1].replace(/\//g, '-');
+            const t = dm[2];
+            const pk = d + ' ' + t;
+            if (pk > lastPubKey) {
+                lastPub = { date: d, time: t, chapter: title };
+                lastPubKey = pk;
+            }
+        }
     }
 
-    return { chapters: allChapters, totalPages, pageCount, lastPublish: lastPub };
+    const totalPages = Math.max(
+        1,
+        ...[...document.querySelectorAll('li.arco-pagination-item')]
+            .map(el => parseInt(el.textContent.trim(), 10))
+            .filter(n => !Number.isNaN(n))
+    );
+    const activePage = document.querySelector('li.arco-pagination-item-active')
+        ?.textContent?.trim() || '1';
+    return { chapters, lastPublish: lastPub, totalPages, activePage };
 }"""
 
 
 # ---------------------------------------------------------------------------
 # JS: 检测章节管理页的卷列表
 # ---------------------------------------------------------------------------
-DETECT_VOLUMES_JS = r"""async () => {
-    const selectEl = document.querySelector(
-        '.chapter-select-left .serial-select.byte-select:not(.chapter-status-select)');
-    if (!selectEl) return { hasVolumes: false, volumes: [], currentVolume: '' };
-
-    const valueEl = selectEl.querySelector('.byte-select-view-value');
-    const currentVolume = valueEl ? valueEl.textContent.trim() : '';
-
-    // 展开下拉读取选项，然后关闭
-    selectEl.click();
-    await new Promise(r => setTimeout(r, 500));
-
-    const volumes = [];
-    for (const opt of document.querySelectorAll(
-            '.byte-select-option.chapter-select-option')) {
-        volumes.push({
-            text: opt.textContent.trim(),
-            isActive: opt.classList.contains('byte-select-option-selected'),
-        });
-    }
-
-    // 关闭下拉
-    selectEl.click();
-    await new Promise(r => setTimeout(r, 300));
-
-    return { hasVolumes: volumes.length > 1, volumes, currentVolume };
-}"""
 
 
 # ---------------------------------------------------------------------------
 # JS: 选择指定卷（直接展开 → 点击目标 → 等待刷新）
 # ---------------------------------------------------------------------------
-SELECT_VOLUME_JS = r"""async (targetText) => {
-    const selectEl = document.querySelector(
-        '.chapter-select-left .serial-select.byte-select:not(.chapter-status-select)');
-    if (!selectEl) return false;
-
-    selectEl.click();
-    await new Promise(r => setTimeout(r, 500));
-
-    for (const opt of document.querySelectorAll(
-            '.byte-select-option.chapter-select-option')) {
-        if (opt.textContent.trim() === targetText) {
-            opt.click();
-            await new Promise(r => setTimeout(r, 800));
-            return true;
-        }
-    }
-
-    // 未找到目标卷，关闭下拉
-    selectEl.click();
-    await new Promise(r => setTimeout(r, 300));
-    return false;
-}"""
 
 
 # ---------------------------------------------------------------------------
 # JS: 检测新建章节页的卷列表
 # ---------------------------------------------------------------------------
-DETECT_EDITOR_VOLUMES_JS = r"""async () => {
-    const trigger = document.querySelector('.publish-header-volume-wrap-info-title');
-    if (!trigger) return { hasVolumes: false, volumes: [], currentVolume: '' };
-
-    const currentVolumeEl = trigger.querySelector('.publish-header-volume-name');
-    const currentVolume = currentVolumeEl ? currentVolumeEl.textContent.trim() : '';
-
-    trigger.click();
-    await new Promise(r => setTimeout(r, 500));
-
-    const volumes = [];
-    for (const opt of document.querySelectorAll('.editor-volume-list-item')) {
-        const txt = opt.textContent.trim();
-        if (txt) {
-            volumes.push({
-                text: txt,
-                isActive: opt.querySelector('.selected') !== null || txt === currentVolume,
-            });
-        }
-    }
-
-    const cancelBtn = [...document.querySelectorAll('button')].find(
-        el => el.textContent.trim() === '取消'
-    );
-    if (cancelBtn) cancelBtn.click();
-    await new Promise(r => setTimeout(r, 300));
-
-    return { hasVolumes: volumes.length > 1, volumes, currentVolume };
-}"""
 
 
 # ---------------------------------------------------------------------------
 # JS: 新建章节页选择指定卷
 # ---------------------------------------------------------------------------
-SELECT_EDITOR_VOLUME_JS = r"""async (targetText) => {
-    const trigger = document.querySelector('.publish-header-volume-wrap-info-title');
-    if (!trigger) return false;
-
-    trigger.click();
-    await new Promise(r => setTimeout(r, 500));
-
-    let matched = false;
-    for (const opt of document.querySelectorAll('.editor-volume-list-item')) {
-        if (opt.textContent.trim() === targetText) {
-            opt.click();
-            matched = true;
-            break;
-        }
-    }
-    if (!matched) {
-        const cancelBtn = [...document.querySelectorAll('button')].find(
-            el => el.textContent.trim() === '取消'
-        );
-        if (cancelBtn) cancelBtn.click();
-        await new Promise(r => setTimeout(r, 300));
-        return false;
-    }
-
-    const confirmBtn = [...document.querySelectorAll('button')].find(
-        el => el.textContent.trim() === '确定'
-    );
-    if (!confirmBtn) return false;
-    confirmBtn.click();
-    await new Promise(r => setTimeout(r, 1000));
-    return true;
-}"""
 
 
 async def detect_volumes(page) -> dict:
-    """检测章节管理页是否有多卷，返回 {hasVolumes, volumes, currentVolume}。"""
-    try:
-        return await page.evaluate(DETECT_VOLUMES_JS)
-    except Exception as e:
-        logger.debug(f"检测卷列表失败: {e}")
-        return {"hasVolumes": False, "volumes": [], "currentVolume": ""}
+    """?????????????"""
+    return await _detect_volumes_impl(
+        page,
+        logger=logger,
+        detect_volumes_js=DETECT_VOLUMES_JS,
+    )
 
 
 async def select_volume(page, volume_text: str) -> bool:
-    """在章节管理页选择指定卷，返回是否成功。选择后等待表格刷新。"""
-    try:
-        ok = await page.evaluate(SELECT_VOLUME_JS, volume_text)
-        if ok:
-            await page.wait_for_timeout(1000)
-            logger.info(f"  已切换到: {volume_text}")
-        else:
-            logger.warning(f"  未找到卷: {volume_text}")
-        return ok
-    except Exception as e:
-        logger.warning(f"选择卷失败: {e}")
-        return False
+    """??????????????"""
+    return await _select_volume_impl(
+        page,
+        volume_text,
+        logger=logger,
+        detect_volumes_js=DETECT_VOLUMES_JS,
+        resolve_volume_name=resolve_volume_name,
+        wait_manage_table_ready=_wait_manage_table_ready,
+        browser_timeout=_browser_timeout,
+    )
 
 
 async def detect_editor_volumes(page) -> dict:
-    """检测新建章节页是否有多卷，返回 {hasVolumes, volumes, currentVolume}。"""
-    try:
-        return await page.evaluate(DETECT_EDITOR_VOLUMES_JS)
-    except Exception as e:
-        logger.debug(f"检测编辑页卷列表失败: {e}")
-        return {"hasVolumes": False, "volumes": [], "currentVolume": ""}
+    """??????????????"""
+    return await _detect_editor_volumes_impl(
+        page,
+        logger=logger,
+        detect_editor_volumes_js=DETECT_EDITOR_VOLUMES_JS,
+    )
+
+
+async def _wait_manage_table_ready(page, timeout_ms: int | None = None):
+    return await _wait_manage_table_ready_impl(
+        page,
+        timeout_ms,
+        browser_timeout=_browser_timeout,
+    )
+
+async def _go_to_next_manage_page(page) -> bool:
+    return await _go_to_next_manage_page_impl(
+        page,
+        wait_manage_table_ready_fn=_wait_manage_table_ready,
+        browser_timeout=_browser_timeout,
+        logger=logger,
+    )
+
+async def _go_to_manage_page_number(page, target_page: int) -> bool:
+    return await _go_to_manage_page_number_impl(
+        page,
+        target_page,
+        wait_manage_table_ready_fn=_wait_manage_table_ready,
+        browser_timeout=_browser_timeout,
+        logger=logger,
+    )
+
+async def _scan_manage_row(page, target_title: str, target_num) -> dict:
+    return await _scan_manage_row_impl(page, target_title, target_num)
+
+async def _click_manage_row_action(page, target_title: str, target_num) -> bool:
+    return await _click_manage_row_action_impl(
+        page,
+        target_title,
+        target_num,
+        browser_timeout=_browser_timeout,
+        logger=logger,
+    )
+
+async def resolve_edit_url_from_manage(page, book_id: str, platform_ch: dict) -> str | None:
+    return await _resolve_edit_url_from_manage_impl(
+        page,
+        book_id,
+        platform_ch,
+        chapter_manage_url_tpl=CHAPTER_MANAGE_URL_TPL,
+        base_url=BASE_URL,
+        select_volume_fn=select_volume,
+        go_to_manage_page_number_fn=_go_to_manage_page_number,
+        scan_manage_row_fn=_scan_manage_row,
+        click_manage_row_action_fn=_click_manage_row_action,
+        logger=logger,
+    )
+
+def _parse_chapter_api_items(items: list, book_id: str) -> list[dict]:
+    chapters: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(
+            item.get("title")
+            or item.get("chapter_title")
+            or item.get("chapter_name")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not title:
+            continue
+        raw_num = (
+            item.get("chapter_num")
+            or item.get("chapter_index")
+            or item.get("index")
+            or item.get("serial_num")
+        )
+        chapter_num = None
+        if raw_num not in (None, ""):
+            try:
+                chapter_num = int(raw_num)
+            except (TypeError, ValueError):
+                chapter_num = None
+        if chapter_num is None:
+            num = _extract_chapter_num(title)
+            if num is not None:
+                chapter_num = int(num)
+        edit_item_id = (
+            item.get("item_id")
+            or item.get("chapter_id")
+            or item.get("id")
+        )
+        edit_url = None
+        if edit_item_id not in (None, ""):
+            edit_url = f"/main/writer/{book_id}/publish/{edit_item_id}/?enter_from=modifychapter"
+        status = ""
+        for key in (
+            "status_desc",
+            "chapter_status_desc",
+            "audit_status_desc",
+            "publish_status_desc",
+            "status_name",
+            "chapter_status_name",
+            "publish_status_name",
+            "audit_status_name",
+            "display_status",
+            "display_status_desc",
+            "status_text",
+        ):
+            value = item.get(key)
+            status = _format_status_value(key, value)
+            if status:
+                break
+        if not status:
+            for key, value in item.items():
+                low = str(key).lower()
+                if "status" not in low:
+                    continue
+                status = _format_status_value(str(key), value)
+                if status:
+                    break
+        chapters.append({
+            "title": title,
+            "chapterNum": chapter_num,
+            "editUrl": edit_url,
+            "status": status,
+        })
+    return chapters
+
+
+def _format_status_value(key: str, value) -> str:
+    key = str(key)
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+        return ""
+    if not isinstance(value, (int, float)) or value is None:
+        return ""
+    num = int(value)
+    if key == "display_status":
+        mapping = {
+            1: "已发布",
+        }
+        label = mapping.get(num)
+        return f"{label} ({key}={num})" if label else f"{key}={num}"
+    return f"{key}={num}"
+
+
+async def _wait_for_cached_chapter_api(page, volume_id: str, page_index: int, timeout_ms: int | None = None):
+    timeout_ms = timeout_ms or _browser_timeout
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+    while asyncio.get_event_loop().time() < deadline:
+        hit = getattr(page, "_chapter_api_cache", {}).get((volume_id, page_index))
+        if hit:
+            return hit
+        await page.wait_for_timeout(200)
+    return None
+
+
+async def _fetch_chapter_api_variant(page, qs: dict, *, status_value: str, page_index: int):
+    params = dict(qs)
+    params["status"] = status_value
+    params["page_index"] = str(page_index)
+    base = (
+        f"{BASE_URL}/api/author/chapter/chapter_list/v1?"
+        + urlencode(params)
+    )
+    await page.evaluate(
+        """async (url) => {
+            try { await fetch(url, { credentials: 'include' }); } catch (e) {}
+        }""",
+        base,
+    )
+    volume_id = str(params.get("volume_id", "") or "")
+    hit = await _wait_for_cached_chapter_api(page, volume_id, page_index, 4000)
+    return hit
+
+
+async def _extract_chapters_via_api(page, book_id: str) -> tuple[list[dict], dict | None] | None:
+    current_volume = await page.evaluate(
+        """() => document.querySelector(
+            '.chapter-select-left .serial-select.byte-select:not(.chapter-status-select) .byte-select-view-value'
+        )?.textContent?.trim() || ''"""
+    )
+    volume_id = getattr(page, "_volume_name_to_id", {}).get(current_volume, "")
+    if not volume_id:
+        return None
+
+    first = await _wait_for_cached_chapter_api(page, volume_id, 0, 4000)
+    if not first:
+        logger.info(f"  API章节列表未命中缓存，回退 DOM: {current_volume}")
+        return None
+
+    data = (first.get("body") or {}).get("data") or {}
+    per_page = int((first.get("qs") or {}).get("page_count", "15") or 15)
+    total_count = int(data.get("total_count") or 0)
+    if total_count == 0:
+        base_qs = dict(first.get("qs") or {})
+        for alt_status in ("1", "2", "3", "-1"):
+            if str(base_qs.get("status", "")) == alt_status:
+                continue
+            alt = await _fetch_chapter_api_variant(page, base_qs, status_value=alt_status, page_index=0)
+            if not alt:
+                continue
+            alt_data = (alt.get("body") or {}).get("data") or {}
+            alt_total = int(alt_data.get("total_count") or 0)
+            logger.info(f"  API扩查状态 status={alt_status} -> total_count={alt_total} | 卷={current_volume}")
+            if alt_total > 0:
+                first = alt
+                data = alt_data
+                total_count = alt_total
+                break
+    total_pages = max(1, (total_count + per_page - 1) // per_page) if total_count else 1
+
+    all_chapters: list[dict] = []
+    seen_keys: set[str] = set()
+    last_pub: dict | None = None
+
+    for page_index in range(total_pages):
+        payload = first if page_index == 0 else None
+        if payload is None:
+            next_btn = page.locator("li.arco-pagination-item-next:not(.arco-pagination-item-disabled)").first
+            if await next_btn.count() == 0:
+                next_btn = page.locator("button[aria-label='next'], .next-page").first
+            if await next_btn.count() == 0:
+                logger.warning(f"  API翻页缺少下一页按钮: 期望第{page_index + 1}页")
+                break
+            await next_btn.click()
+            payload = await _wait_for_cached_chapter_api(page, volume_id, page_index, 6000)
+            if payload is None:
+                logger.warning(f"  API未等到第{page_index + 1}页响应: volume_id={volume_id}")
+                break
+
+        body = payload.get("body") or {}
+        data = body.get("data") or {}
+        items = data.get("item_list") or []
+        page_chapters = _parse_chapter_api_items(items, book_id)
+        for ch in page_chapters:
+            key = f"{ch.get('chapterNum')}|{ch.get('title', '')}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ch["rowIndex"] = len(all_chapters)
+            ch["pageIndex"] = page_index + 1
+            ch["volumeText"] = current_volume
+            all_chapters.append(ch)
+
+        logger.info(
+            f"  API第{page_index + 1}页: {len(page_chapters)} 条 | volume_id={volume_id} | 卷={current_volume}"
+        )
+
+    logger.info(f"  API共 {len(all_chapters)} 个章节 | 卷={current_volume}")
+    return all_chapters, last_pub
 
 
 async def select_editor_volume(page, volume_text: str) -> bool:
-    """在新建章节页选择指定卷，返回是否成功。"""
-    try:
-        ok = await page.evaluate(SELECT_EDITOR_VOLUME_JS, volume_text)
-        if ok:
-            await page.wait_for_timeout(1000)
-            logger.info(f"  已切换到分卷: {volume_text}")
-        else:
-            logger.warning(f"  编辑页未找到分卷: {volume_text}")
-        return ok
-    except Exception as e:
-        logger.warning(f"编辑页切换分卷失败: {e}")
-        return False
-
-
-def resolve_new_chapter_volume(
-    chapter_num: str | None, cfg: dict
-) -> str:
-    """根据配置与章节号决定新建章节应落入的分卷。"""
-    chosen = str(cfg.get("default_new_chapter_volume", "") or "").strip()
-    if not chapter_num:
-        return chosen
-    try:
-        num = int(chapter_num)
-    except (TypeError, ValueError):
-        return chosen
-
-    rules = cfg.get("new_chapter_volume_rules", [])
-    if not isinstance(rules, list):
-        return chosen
-
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        volume = str(rule.get("volume", "") or "").strip()
-        if not volume:
-            continue
-        min_ch = rule.get("min_chapter")
-        max_ch = rule.get("max_chapter")
-        try:
-            if min_ch is not None and num < int(min_ch):
-                continue
-            if max_ch is not None and num > int(max_ch):
-                continue
-        except (TypeError, ValueError):
-            continue
-        return volume
-    return chosen
+    """??????????????"""
+    return await _select_editor_volume_impl(
+        page,
+        volume_text,
+        logger=logger,
+        resolve_volume_name=resolve_volume_name,
+        detect_editor_volumes_js=DETECT_EDITOR_VOLUMES_JS,
+        select_editor_volume_js=SELECT_EDITOR_VOLUME_JS,
+    )
 
 
 async def extract_chapters_from_page(
     page, book_id: str = "",
 ) -> tuple[list[dict], dict | None]:
-    """从章节管理页提取全部章节列表（单次 JS 调用完成全部翻页）。
+    """从章节管理页提取全部章节列表（优先 API，其次 DOM）。
 
     返回 (chapters, last_publish_info)。
     last_publish_info: {date, time, chapter} 或 None。
     """
-    result = await page.evaluate(
-        _EXTRACT_ALL_JS,
-        # maxTime = 8x: 自动翻页可能需要遍历多页，总时长需大于单页超时
-        {"waitTimeout": _browser_timeout, "maxTime": _browser_timeout * 8},
-    )
-    chapters = result.get("chapters", [])
-    total_pages = result.get("totalPages", 0)
-    page_count = result.get("pageCount", 0)
-    last_pub = result.get("lastPublish")
+    api_result = await _extract_chapters_via_api(page, book_id)
+    if api_result is not None:
+        return api_result
 
-    if total_pages:
-        logger.info(f"  共 {page_count}/{total_pages} 页, {len(chapters)} 个章节")
-    elif chapters:
-        logger.info(f"  共 {page_count} 页, {len(chapters)} 个章节")
+    all_chapters: list[dict] = []
+    seen_keys: set[str] = set()
+    last_pub: dict | None = None
+    last_pub_key = ""
+    page_count = 0
+    total_pages = 1
 
-    return chapters, last_pub
+    while True:
+        page_state = await _wait_manage_table_ready(page)
+        result = await page.evaluate(EXTRACT_CURRENT_PAGE_JS)
+        total_pages = int(result.get("totalPages") or 1)
+        active_page = str(result.get("activePage") or "1")
+        page_rows = result.get("chapters", []) or []
+        page_count += 1
 
+        for ch in page_rows:
+            if ch.get("chapterNum") is None:
+                num = _extract_chapter_num(str(ch.get("title", "") or ""))
+                if num is not None:
+                    try:
+                        ch["chapterNum"] = int(num)
+                    except ValueError:
+                        pass
+            key = f"{ch.get('chapterNum')}|{ch.get('title', '')}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ch["rowIndex"] = len(all_chapters)
+            all_chapters.append(ch)
 
-def match_chapters(
-    local_parsed: list[tuple],
-    platform_chapters: list[dict],
-) -> tuple[list, list]:
-    """
-    按章节号匹配本地文件与平台章节。
+        cur_last_pub = result.get("lastPublish")
+        if cur_last_pub:
+            pk = f"{cur_last_pub.get('date', '')} {cur_last_pub.get('time', '')}"
+            if pk > last_pub_key:
+                last_pub_key = pk
+                last_pub = cur_last_pub
 
-    返回: (matched, unmatched_local)
-      matched: [(local_idx, platform_ch, int_num, title, content), ...]
-      unmatched_local: [(local_idx, chapter_num, title), ...]
-    """
-    # 平台章节按 chapterNum(int) 建字典
-    platform_map: dict[int, dict] = {}
-    for ch in platform_chapters:
-        num = ch.get("chapterNum")
-        if num is not None and num not in platform_map:
-            platform_map[num] = ch
+        logger.info(
+            f"  第{active_page}页抓取: {len(page_rows)} 条 | 首行: {page_state.get('firstTitle') or '[空]'}"
+        )
 
-    matched = []
-    unmatched = []
-    for i, (num, title, content) in enumerate(local_parsed):
-        int_num = int(num) if num else None
-        if int_num is not None and int_num in platform_map:
-            matched.append((i, platform_map[int_num], int_num, title, content))
-        else:
-            unmatched.append((i, num, title))
-    return matched, unmatched
+        if active_page == str(total_pages):
+            break
+        if not await _go_to_next_manage_page(page):
+            break
+
+    missing_num_titles = [
+        str(ch.get("title", "") or "")
+        for ch in all_chapters
+        if ch.get("chapterNum") is None
+    ]
+    logger.info(f"  共 {page_count}/{total_pages} 页, {len(all_chapters)} 个章节")
+    if missing_num_titles:
+        preview = " | ".join(missing_num_titles[:5])
+        logger.info(
+            f"  仍有 {len(missing_num_titles)} 个平台章节未解析出章节号: {preview}"
+        )
+
+    return all_chapters, last_pub
 
 
 async def click_next_step(page):
     """点击下一步按钮（进入发布流程）。"""
-    # 精确定位发布按钮（class 含 publish-button），避开 React Tour 引导中的同名按钮
+    await dismiss_overlays(page)
+    await _settle_editor_before_publish(page)
+    before_state = await get_publish_flow_state(page)
+    next_state = await _get_next_step_button_state(page)
+    if next_state.get("found") and next_state.get("totalMatches", 0) > 1:
+        logger.info(
+            f"  检测到多个“下一步”按钮，优先点击主按钮: count={next_state.get('totalMatches')}"
+        )
+    if next_state.get("found") and next_state.get("disabled"):
+        logger.info("  “下一步”当前不可点击，等待编辑器状态稳定")
+        for _ in range(10):
+            await _settle_editor_before_publish(page)
+            next_state = await _get_next_step_button_state(page)
+            if not next_state.get("disabled"):
+                break
+            await page.wait_for_timeout(400)
+        if next_state.get("disabled"):
+            hints = " | ".join(next_state.get("hints") or [])
+            if hints:
+                logger.warning(f"  “下一步”仍不可点击，页面提示: {hints}")
+            else:
+                logger.warning("  “下一步”仍不可点击，未发现明显表单提示")
+    if await _click_visible_action(page, ["下一步"], wait_ms=400):
+        async def _wait_after_click() -> bool:
+            for _ in range(12):
+                await page.wait_for_timeout(400)
+                cur_state = await get_publish_flow_state(page)
+                if cur_state.get("hasPublishSettings"):
+                    return True
+                if (
+                    cur_state.get("hasContinueEdit")
+                    or cur_state.get("hasSubmitConfirm")
+                    or cur_state.get("hasRiskDialog")
+                    or cur_state.get("hasIgnoreAll")
+                ):
+                    return True
+                if not _is_same_publish_flow_state(before_state, cur_state):
+                    return True
+            return False
+        if await _wait_after_click():
+            return
+
     next_btn = page.locator("button.auto-editor-next")
-    if await next_btn.count() > 0:
-        await next_btn.click()
-    else:
-        # 兜底：排除 React Tour 中的按钮
+    if await next_btn.count() == 0:
         next_btn = page.locator("button", has_text="下一步").locator(
             "visible=true"
         ).first
-        await next_btn.click()
-    await page.wait_for_timeout(2000)
 
+    async def _wait_after_click() -> bool:
+        for _ in range(12):
+            await page.wait_for_timeout(400)
+            cur_state = await get_publish_flow_state(page)
+            if cur_state.get("hasPublishSettings"):
+                return True
+            if (
+                cur_state.get("hasContinueEdit")
+                or cur_state.get("hasSubmitConfirm")
+                or cur_state.get("hasRiskDialog")
+                or cur_state.get("hasIgnoreAll")
+            ):
+                return True
+            if not _is_same_publish_flow_state(before_state, cur_state):
+                return True
+        return False
 
-# ---------------------------------------------------------------------------
-# 定时发布
-# ---------------------------------------------------------------------------
-def _validate_times(raw: str) -> list[str]:
-    """解析、校验、排序、去重时间字符串。
+    async def _click_locator(locator, *, force: bool = False) -> bool:
+        try:
+            if await locator.count() == 0:
+                return False
+            await locator.first.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await locator.first.click(force=force)
+            return True
+        except Exception as e:
+            logger.debug(f"点击“下一步”失败(force={force}): {e}")
+            return False
 
-    输入: 逗号分隔的时间 (如 "20:00, 08:00, 12:00")
-    输出: 合法的 HH:MM 列表, 已排序去重 (如 ["08:00", "12:00", "20:00"])
-    不合法的条目静默丢弃。
+    if await _click_locator(next_btn) and await _wait_after_click():
+        return
 
-    兼容: 全角标点 (，：；)、单位数小时 (8:00 -> 08:00)。
-    """
-    # 标准化分隔符: 全角逗号/分号 → 半角逗号
-    raw = raw.replace("\uff0c", ",").replace("\uff1b", ",").replace(";", ",")
-    result = []
-    for t in raw.split(","):
-        t = t.strip().replace("\uff1a", ":")  # 全角冒号 → 半角
-        m = re.match(r"^(\d{1,2}):(\d{2})$", t)
-        if not m:
-            continue
-        h, mi = int(m.group(1)), int(m.group(2))
-        if 0 <= h <= 23 and 0 <= mi <= 59:
-            result.append(f"{h:02d}:{mi:02d}")
-    # 字符串排序对 HH:MM 格式等同时间排序; dict.fromkeys 保序去重
-    return list(dict.fromkeys(sorted(result)))
+    logger.info("  点击“下一步”后页面仍停留原位，尝试强制点击")
+    if await _click_locator(next_btn, force=True) and await _wait_after_click():
+        return
 
+    js_clicked = await page.evaluate("""() => {
+        const norm = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+        const visible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const candidates = Array.from(document.querySelectorAll('button.auto-editor-next, button, [role="button"]'))
+            .filter((el) => visible(el) && norm(el.innerText || el.textContent || '').includes('下一步'));
+        const pickScore = (el) => {
+            const rect = el.getBoundingClientRect();
+            const primary = (el.className || '').includes('auto-editor-next') ? 1000000 : 0;
+            const enabled = (!el.disabled
+                && el.getAttribute('aria-disabled') !== 'true'
+                && !el.classList.contains('disabled')) ? 100000 : 0;
+            return primary + enabled + Math.round(rect.bottom * 10) + Math.round(rect.width * rect.height);
+        };
+        const btn = candidates.slice().sort((a, b) => pickScore(b) - pickScore(a))[0] || null;
+        if (!btn) return false;
+        btn.scrollIntoView({ block: 'center', inline: 'center' });
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+            btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        });
+        return true;
+    }""")
+    if js_clicked and await _wait_after_click():
+        return
 
-def compute_schedule(
-    file_count: int, start_date: str, pub_time: str, per_day: int
-) -> list[tuple[str, str]]:
-    """
-    计算每章的定时发布日期和时间。
-
-    pub_time 支持逗号分隔的多个时间（如 "08:00,12:00,20:00"），
-    每天内的章节按顺序使用各时间点。
-
-    规则:
-      - 时间点数量 > per_day 时, 以时间点数量为准
-      - 时间点不足时, 均匀分配到各时间点, 同一时间内每章 +1 分钟
-      - 每个时间段上限为下一时间点前 1 分钟 (末尾为 23:59), 防止重叠
-
-    返回: [(date_str, time_str), ...] 长度等于 file_count
-    """
-    per_day = max(1, per_day)
-    base = datetime.strptime(start_date, "%Y-%m-%d")
-    times = _validate_times(pub_time)
-    if not times:
-        times = ["08:00"]
-    # 时间点数量 > per_day 时，以时间点为准
-    effective = max(per_day, len(times))
-    # 时间点不足时，均匀分配到各时间点，每个时间点内 +1 分钟递增
-    if len(times) < effective:
-        n_times = len(times)
-        cap_global = datetime.strptime("23:59", "%H:%M")
-        parsed_times = [datetime.strptime(t, "%H:%M") for t in times]
-        expanded = []
-        for t_idx in range(n_times):
-            count = effective // n_times + (1 if t_idx < effective % n_times else 0)
-            base_t = parsed_times[t_idx]
-            # 每个时间段的上限: 下一时间点前 1 分钟, 末尾为 23:59
-            slot_cap = (parsed_times[t_idx + 1] - timedelta(minutes=1)
-                        if t_idx + 1 < n_times else cap_global)
-            for j in range(count):
-                nxt = base_t + timedelta(minutes=j)
-                if nxt > slot_cap:
-                    nxt = slot_cap
-                expanded.append(nxt.strftime("%H:%M"))
-        times = expanded
-    schedule = []
-    for i in range(file_count):
-        day_offset = i // effective
-        d = base + timedelta(days=day_offset)
-        slot = i % effective
-        t = times[slot]
-        schedule.append((d.strftime("%Y-%m-%d"), t))
-    return schedule
+    logger.warning(
+        f"  点击“下一步”后页面状态未明显变化: {_format_publish_flow_state(before_state)}"
+    )
 
 
 async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
@@ -1189,55 +1418,82 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
 
     本函数统一处理两种情况。
     """
-    # --- Step 1: 点击"下一步" ---
     await click_next_step(page)
+    stagnant_editor_rounds = 0
+    last_state: dict | None = None
 
-    # --- Step 2: 循环处理所有可能出现的弹窗/面板 ---
-    for _ in range(10):
-        # 平台当日字数上限检测
+    for step in range(10):
+        handled_overlay = await dismiss_overlays(page)
+        if handled_overlay == "继续编辑":
+            logger.info("已继续编辑，补点一次“下一步”继续进入发布流程")
+            await click_next_step(page)
+            await page.wait_for_timeout(1200)
+
         await _check_daily_limit(page)
+        state = await log_publish_flow_state(page, f"publish-loop-{step + 1}")
 
-        # 已经到达发布设置?
-        if await page.locator("text=发布设置").count() > 0:
+        if state.get("hasPublishSettings") or await page.locator("text=发布设置").count() > 0:
             await _apply_publish_options(page, use_ai=use_ai)
             return
 
-        # 纠错面板: 如果出现"忽略全部"按钮 -> 点击它，再点"下一步"
         try:
-            ignore_btn = page.locator("button", has_text="忽略全部")
-            if await ignore_btn.count() > 0 and await ignore_btn.first.is_visible():
-                await ignore_btn.first.click()
-                await page.wait_for_timeout(800)
+            ignore_labels = ("忽略全部", "全部忽略", "暂不处理", "关闭", "我知道了", "知道了")
+            handled_ignore = False
+            clicked_label = await _click_visible_action(page, ignore_labels)
+            if clicked_label:
+                logger.info(f"  检测到侧栏/弹窗按钮，点击: {clicked_label}")
                 await click_next_step(page)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1200)
+                handled_ignore = True
+                stagnant_editor_rounds = 0
+                last_state = None
+            if handled_ignore:
                 continue
         except Exception:
             pass
 
-        # 错别字确认: "检测到你还有错别字未修改，是否确定提交?"
         if await page.locator("text=是否确定提交").count() > 0:
-            submit_btn = page.locator("button", has_text="提交")
-            if await submit_btn.count() > 0:
-                await submit_btn.first.click()
+            if await _click_visible_action(page, ["提交", "确认"]):
                 await page.wait_for_timeout(1000)
                 continue
 
-        # 内容风险检测: "是否进行内容风险检测?" -> 取消跳过
         if await page.locator("text=是否进行内容风险检测").count() > 0:
-            cancel_btn = page.locator("button", has_text="取消")
-            if await cancel_btn.count() > 0:
-                await cancel_btn.first.click()
+            if await _click_visible_action(page, ["取消", "暂不处理", "跳过"]):
                 await page.wait_for_timeout(1000)
                 continue
 
-        # 还没匹配到任何已知状态，等一下再检查
+        is_editor_still_waiting = (
+            state.get("editorVisible")
+            and state.get("hasNextStep")
+            and not state.get("hasPublishSettings")
+            and not state.get("hasContinueEdit")
+            and not state.get("hasSubmitConfirm")
+            and not state.get("hasRiskDialog")
+            and not state.get("hasIgnoreAll")
+        )
+        if is_editor_still_waiting:
+            if _is_same_publish_flow_state(last_state, state):
+                stagnant_editor_rounds += 1
+            else:
+                stagnant_editor_rounds = 1
+            last_state = state
+            if stagnant_editor_rounds >= 2:
+                logger.info("  仍停留在编辑页，补点一次“下一步”")
+                await click_next_step(page)
+                await page.wait_for_timeout(1200)
+                stagnant_editor_rounds = 0
+                last_state = None
+                continue
+        else:
+            stagnant_editor_rounds = 0
+            last_state = state
+
         await page.wait_for_timeout(1000)
 
-    # 兜底: 等发布设置出现
+    await log_publish_flow_state(page, "publish-timeout-before-wait")
     await page.wait_for_selector("text=发布设置", timeout=_browser_timeout)
-
-    # --- 到达发布设置后，应用选项 ---
     await _apply_publish_options(page, use_ai=use_ai)
+    return
 
 
 async def _apply_publish_options(page, *, use_ai: bool = False):
@@ -1350,17 +1606,7 @@ async def publish_scheduled(page, date_str: str, time_str: str, *, use_ai: bool 
         await page.wait_for_timeout(300)
 
     # 5. 确认发布
-    await _check_daily_limit(page)
-    confirm_btn = page.locator("button", has_text="确认发布")
-    if await confirm_btn.count() == 0:
-        raise RuntimeError("未找到确认发布按钮")
-    await confirm_btn.first.click(no_wait_after=True)
-    # 等待发布对话框关闭（确认发布按钮消失即为成功）
-    try:
-        await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-    except Exception:
-        await page.wait_for_timeout(2000)
-    await _check_daily_limit(page)
+    await confirm_publish(page)
 
 
 # ---------------------------------------------------------------------------
@@ -1448,13 +1694,13 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         logger.error(f"目录不存在: {directory}")
         return
 
-    files = get_md_files(directory)
+    files = get_md_files(directory, warn=logger.warning)
     if not files:
         logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
     # 解析所有文件
-    parsed = [parse_md_file(f) for f in files]
+    parsed = [parse_md_file(f, warn=logger.warning) for f in files]
 
     # 检测重复标题
     title_counts = Counter(title for _, title, _ in parsed)
@@ -1530,7 +1776,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         # 先验证登录态：打开新建章节页看是否能进入编辑器
         await page.goto(new_chapter_url)
         try:
-            await wait_for_editor_ready(page)
+            await wait_for_editor_ready(page, prefer_continue_edit=False)
         except PWTimeout:
             logger.error("无法进入编辑器，请检查:")
             logger.info("  1. Book ID 是否正确")
@@ -1542,6 +1788,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         success = 0
         failed = 0
         max_retries = cfg.get("max_retries", 2)
+        daily_limit_reason = ""
 
         for i, file in enumerate(files):
             chapter_num, title, content = parsed[i]
@@ -1557,7 +1804,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     # 首章首次复用当前页面，其余情况导航到新建 URL
                     if i > 0 or attempt > 1:
                         await page.goto(new_chapter_url)
-                        await wait_for_editor_ready(page)
+                        await wait_for_editor_ready(page, prefer_continue_edit=False)
 
                     if target_volume:
                         await select_editor_volume(page, target_volume)
@@ -1569,15 +1816,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                         logger.info(f"  -> 定时发布 {date_str} {time_str}")
                     elif publish:
                         await _navigate_to_publish_settings(page, use_ai=use_ai)
-                        confirm_btn = page.locator("button", has_text="确认发布")
-                        if await confirm_btn.count() == 0:
-                            raise RuntimeError("未找到确认发布按钮")
-                        await confirm_btn.first.click(no_wait_after=True)
-                        try:
-                            await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-                        except Exception:
-                            await page.wait_for_timeout(2000)
-                        await _check_daily_limit(page)
+                        await confirm_publish(page)
                         logger.info(f"  -> 已发布")
                     else:
                         await save_draft(page)
@@ -1588,10 +1827,18 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 
                 except DailyLimitReached as e:
                     logger.warning(f"{e}")
+                    logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
+                    daily_limit_reason = str(e)
                     daily_limit = True
                     break
 
                 except Exception as e:
+                    if is_daily_limit_exception(e):
+                        daily_limit_reason = daily_limit_stop_message()
+                        logger.warning(f"{daily_limit_reason}")
+                        logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
+                        daily_limit = True
+                        break
                     if attempt <= max_retries:
                         logger.warning(f"第{attempt}次失败: {e}，重试中...")
                         await page.wait_for_timeout(2000)
@@ -1619,6 +1866,9 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         await save_auth(context)
         await browser.close()
 
+        if daily_limit_reason:
+            logger.warning(f"{daily_limit_reason}，已提前结束上传流程。")
+
         logger.info("")
         logger.info("=" * 40)
         logger.info(f"  上传完成!")
@@ -1630,7 +1880,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 # 修改单章（CLI 和 GUI 共用）
 # ---------------------------------------------------------------------------
 async def edit_one_chapter(
-    page, edit_url: str, ch_num: int, title: str, content: str,
+    page, book_id: str, platform_ch: dict, ch_num: int, title: str, content: str,
     *, use_ai: bool = False, max_retries: int = 2,
 ) -> bool:
     """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。
@@ -1639,27 +1889,48 @@ async def edit_one_chapter(
     """
     for attempt in range(1, max_retries + 2):
         try:
-            await page.goto(edit_url)
+            edit_url = str(platform_ch.get("editUrl", "") or "").strip()
+            if edit_url.startswith("/"):
+                edit_url = BASE_URL + edit_url
+            if not edit_url:
+                edit_url = await resolve_edit_url_from_manage(page, book_id, platform_ch)
+            if not edit_url:
+                raise RuntimeError("未找到真实编辑链接")
+            if edit_url != "__ALREADY_OPENED__":
+                await page.goto(edit_url)
+            await dismiss_overlays(page)
             await wait_for_editor_ready(page)
+            await dismiss_overlays(page)
             await dismiss_edit_hint(page)
+            prefill = await inspect_editor_prefill(page)
+            loaded_num = str(prefill.get("chapterNum", "") or "").strip()
+            if not prefill.get("hasContent") and not str(prefill.get("title", "") or "").strip():
+                raise RuntimeError("进入了空白编辑页，疑似新建/草稿页，已中止以避免误创建草稿")
+            if loaded_num and loaded_num != str(ch_num):
+                fallback_url = await resolve_edit_url_from_manage(page, book_id, platform_ch)
+                if fallback_url and fallback_url != "__ALREADY_OPENED__":
+                    await page.goto(fallback_url)
+                    await dismiss_overlays(page)
+                    await wait_for_editor_ready(page)
+                    await dismiss_overlays(page)
+                    await dismiss_edit_hint(page)
+                    prefill = await inspect_editor_prefill(page)
+                    loaded_num = str(prefill.get("chapterNum", "") or "").strip()
+                if loaded_num and loaded_num != str(ch_num):
+                    raise RuntimeError(
+                        f"进入的编辑页章节号不匹配: 当前={loaded_num}, 目标={ch_num}"
+                    )
             await clear_editor(page)
             await fill_chapter(page, str(ch_num), title, content)
             await _navigate_to_publish_settings(page, use_ai=use_ai)
-            await _check_daily_limit(page)
-            confirm_btn = page.locator("button", has_text="确认发布")
-            if await confirm_btn.count() == 0:
-                raise RuntimeError("未找到确认发布按钮")
-            await confirm_btn.first.click(no_wait_after=True)
-            try:
-                await confirm_btn.first.wait_for(state="hidden", timeout=_browser_timeout)
-            except Exception:
-                await page.wait_for_timeout(2000)
-            await _check_daily_limit(page)
+            await confirm_publish(page)
             logger.info("  -> 已保存修改")
             return True
         except DailyLimitReached:
             raise
         except Exception as e:
+            if is_daily_limit_exception(e):
+                raise DailyLimitReached(daily_limit_stop_message()) from e
             if attempt <= max_retries:
                 logger.warning(f"第{attempt}次失败: {e}，重试中...")
                 await page.wait_for_timeout(2000)
@@ -1966,17 +2237,18 @@ async def cmd_edit(directory: Path, book_id: str, args):
     delay = args.delay if args.delay is not None else cfg.get("delay_between_chapters", 3)
     unique_titles = getattr(args, "unique_titles", False)
     use_ai = getattr(args, "use_ai", False)
+    match_number_only = getattr(args, "match_number_only", False)
 
     if not directory.is_dir():
         logger.error(f"目录不存在: {directory}")
         return
 
-    files = get_md_files(directory)
+    files = get_md_files(directory, warn=logger.warning)
     if not files:
         logger.warning(f"在 {directory} 及其子文件夹中没有找到 .md/.txt 文件")
         return
 
-    parsed = [parse_md_file(f) for f in files]
+    parsed = [parse_md_file(f, warn=logger.warning) for f in files]
     if unique_titles:
         parsed = deduplicate_titles(parsed)
 
@@ -2001,7 +2273,12 @@ async def cmd_edit(directory: Path, book_id: str, args):
         logger.info(f"平台共有 {len(platform_chapters)} 个章节。")
 
         # 匹配
-        matched, unmatched = match_chapters(parsed, platform_chapters)
+        matched, unmatched = match_chapters(
+            parsed,
+            platform_chapters,
+            number_only=match_number_only,
+            exclude_draft=True,
+        )
 
         if not matched:
             logger.warning("没有匹配到任何章节！请检查本地文件是否包含章节号。")
@@ -2018,6 +2295,9 @@ async def cmd_edit(directory: Path, book_id: str, args):
             logger.info(f"  第{ch_num}章 {title} ({wc}字) -> {plat_ch['title']}")
         logger.info("-" * 60)
         logger.info(f"总计: {len(matched)} 章, {total_words} 字")
+        logger.info(
+            "匹配规则: 仅章节号" if match_number_only else "匹配规则: 章节号+标题"
+        )
 
         if unmatched:
             logger.warning(f"未匹配 (跳过) {len(unmatched)} 个本地文件:")
@@ -2040,17 +2320,8 @@ async def cmd_edit(directory: Path, book_id: str, args):
         for i, (local_idx, plat_ch, ch_num, title, content) in enumerate(matched):
             logger.info(f"[{i+1}/{total}] 修改第{ch_num}章 {title}")
 
-            edit_url = plat_ch.get("editUrl")
-            if not edit_url:
-                logger.error("无法获取编辑链接，跳过")
-                failed += 1
-                continue
-
-            if edit_url.startswith("/"):
-                edit_url = BASE_URL + edit_url
-
             try:
-                if await edit_one_chapter(page, edit_url, ch_num, title, content,
+                if await edit_one_chapter(page, book_id, plat_ch, ch_num, title, content,
                                           use_ai=use_ai,
                                           max_retries=cfg.get("max_retries", 2)):
                     success += 1
@@ -2058,6 +2329,7 @@ async def cmd_edit(directory: Path, book_id: str, args):
                     failed += 1
             except DailyLimitReached as e:
                 logger.warning(f"{e}")
+                logger.warning("触发平台当日字数上限，停止当前任务，不再重试。")
                 failed += 1
                 break
 
@@ -2138,7 +2410,11 @@ def main():
     )
     up.add_argument(
         "--edit", action="store_true",
-        help="修改已有章节 (按章节号匹配, 不可与 --publish/--schedule 同时使用)",
+        help="修改已有章节 (默认按章节号+标题匹配, 不可与 --publish/--schedule 同时使用)",
+    )
+    up.add_argument(
+        "--match-number-only", action="store_true",
+        help="修改内容时仅按章节号匹配, 忽略标题差异",
     )
 
     args = parser.parse_args()

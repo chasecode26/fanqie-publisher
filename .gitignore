@@ -26,6 +26,7 @@ fanqie_error.log.*
 .idea/
 .vscode/
 *.code-workspace
+.omx/
 
 # OS
 .DS_Store
