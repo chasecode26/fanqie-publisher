@@ -308,12 +308,25 @@ async def dismiss_overlays(page, *, prefer_continue_edit: bool = True):
     # 1. “是否继续编辑”弹窗：已进入目标正文编辑页时应优先继续编辑。
     try:
         dialog_text = page.locator("text=是否继续编辑").first
-        if await dialog_text.count() > 0 and await dialog_text.is_visible():
+        draft_text = page.locator("text=有刚刚更新的草稿").first
+        has_dialog_text = (
+            (await dialog_text.count() > 0 and await dialog_text.is_visible())
+            or (await draft_text.count() > 0 and await draft_text.is_visible())
+        )
+        if has_dialog_text:
             logger.info("检测到“是否继续编辑”弹窗，尝试关闭")
 
             clicked = False
             labels = ("继续编辑", "取消", "放弃") if prefer_continue_edit else ("取消", "放弃", "继续编辑")
+            clicked_label = await _click_visible_action(page, labels, wait_ms=800)
+            if clicked_label:
+                logger.info(f"已点击弹窗按钮: {clicked_label}")
+                handled_label = clicked_label
+                clicked = True
+
             for label in labels:
+                if clicked:
+                    break
                 btn = page.locator("button", has_text=label)
                 if await btn.count() == 0:
                     btn = page.locator("[role='button']", has_text=label)
@@ -331,14 +344,59 @@ async def dismiss_overlays(page, *, prefer_continue_edit: bool = True):
                 except Exception as e:
                     logger.debug(f"点击“{label}”失败，继续尝试其他按钮: {e}")
 
+            if not clicked:
+                try:
+                    clicked_label = await page.evaluate(
+                        """(labels) => {
+                            const normalize = (text) => String(text || '').split(/\\s+/).filter(Boolean).join(' ').trim();
+                            const visible = (el) => {
+                                if (!el) return false;
+                                const style = window.getComputedStyle(el);
+                                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                                const rect = el.getBoundingClientRect();
+                                return rect.width > 0 && rect.height > 0;
+                            };
+                            const dialogs = Array.from(document.querySelectorAll(
+                                '[role="dialog"], .arco-modal, .semi-modal, [class*="modal"], [class*="dialog"]'
+                            )).filter(visible);
+                            const roots = dialogs.length ? dialogs : [document.body];
+                            const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll(
+                                'button, [role="button"], .arco-btn, .semi-button, [class*="btn"], [class*="button"]'
+                            ))).filter(visible);
+
+                            for (const label of labels) {
+                                const btn = candidates.find((el) => normalize(el.innerText || el.textContent || '') === label);
+                                if (!btn) continue;
+                                btn.scrollIntoView({ block: 'center', inline: 'center' });
+                                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                                    btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                                });
+                                return label;
+                            }
+                            return '';
+                        }""",
+                        list(labels),
+                    )
+                    if clicked_label:
+                        logger.info(f"已通过兜底点击弹窗按钮: {clicked_label}")
+                        handled_label = str(clicked_label)
+                        clicked = True
+                except Exception as e:
+                    logger.debug(f"兜底点击“是否继续编辑”弹窗失败: {e}")
+
             if clicked:
                 try:
-                    await dialog_text.wait_for(state="hidden", timeout=3000)
+                    if await dialog_text.count() > 0:
+                        await dialog_text.wait_for(state="hidden", timeout=3000)
+                    elif await draft_text.count() > 0:
+                        await draft_text.wait_for(state="hidden", timeout=3000)
                     logger.info("“是否继续编辑”弹窗已关闭")
                 except Exception:
                     await page.wait_for_timeout(1000)
                     still_visible = (
                         await dialog_text.count() > 0 and await dialog_text.is_visible()
+                    ) or (
+                        await draft_text.count() > 0 and await draft_text.is_visible()
                     )
                     if still_visible:
                         logger.warning("“是否继续编辑”弹窗点击后仍可见")
@@ -419,6 +477,33 @@ async def _click_visible_action(
     return str(clicked or "")
 
 
+async def _handle_publish_interruption_dialogs(page) -> str:
+    """处理发布流程中插入的确认/检测弹窗，返回已点击的按钮文案。"""
+    state = await get_publish_flow_state(page)
+    body_text = str(state.get("bodyText") or "")
+
+    if state.get("hasContinueEdit"):
+        clicked = await _click_visible_action(page, ("继续编辑", "取消", "放弃"), wait_ms=800)
+        if clicked:
+            return clicked
+
+    if state.get("hasSubmitConfirm"):
+        clicked = await _click_visible_action(page, ("提交", "确认", "确定", "继续发布"), wait_ms=1000)
+        if clicked:
+            return clicked
+
+    if state.get("hasRiskDialog"):
+        # 新版弹窗为“请选择内容检测方式”，基础检测不限次数，适合自动发布。
+        risk_labels = ("仅基础检测", "基础检测", "暂不处理", "跳过", "取消")
+        if "全面检测" in body_text and "仅基础检测" in body_text:
+            risk_labels = ("仅基础检测", "基础检测")
+        clicked = await _click_visible_action(page, risk_labels, wait_ms=1200)
+        if clicked:
+            return clicked
+
+    return ""
+
+
 async def confirm_publish(page, *, labels: tuple[str, ...] = ("确认发布", "定时发布", "发布")):
     """确认发布/定时发布，并等待发布弹窗关闭。"""
     await _check_daily_limit(page)
@@ -429,21 +514,24 @@ async def confirm_publish(page, *, labels: tuple[str, ...] = ("确认发布", "�
             f"未找到确认发布按钮 | {_format_publish_flow_state(state)}"
         )
 
+    final_label = clicked_label
     dialog_closed = False
-    for _ in range(12):
+    for _ in range(18):
         await page.wait_for_timeout(400)
         state = await get_publish_flow_state(page)
+        handled = await _handle_publish_interruption_dialogs(page)
+        if handled:
+            logger.info(f"  检测到发布确认/检测弹窗，点击: {handled}")
+            final_label = handled
+            continue
         if not state.get("hasPublishSettings"):
-            dialog_closed = True
-            break
-        if state.get("hasContinueEdit") or state.get("hasSubmitConfirm") or state.get("hasRiskDialog"):
             dialog_closed = True
             break
     if not dialog_closed:
         await page.wait_for_timeout(2000)
 
     await _check_daily_limit(page)
-    logger.info(f"  -> 已点击{clicked_label}")
+    logger.info(f"  -> 已点击{final_label}")
 
 
 async def wait_for_editor_ready(page, timeout=None, *, prefer_continue_edit: bool = True):
@@ -514,21 +602,42 @@ async def fill_chapter(page, chapter_num: str | None, title: str, content: str):
                 titleInput.dispatchEvent(new Event('change', { bubbles: true }));
             }
 
-            // 3. 粘贴正文 (ClipboardEvent -> ProseMirror)
-            const editor = document.querySelector('.ProseMirror');
-            if (editor) {
-                editor.focus();
-                const dt = new DataTransfer();
-                dt.setData('text/plain', content);
-                const evt = new ClipboardEvent('paste', {
-                    clipboardData: dt,
-                    bubbles: true,
-                    cancelable: true,
-                });
-                editor.dispatchEvent(evt);
-            }
         }""",
-        [chapter_num or "", title, plain_content],
+        [chapter_num or "", title, ""],
+    )
+
+    # 继续编辑旧草稿时，编辑器可能已有内容。用真实键盘事件清空，确保平台状态被触发。
+    editor = page.locator(".ProseMirror").first
+    await editor.click()
+    await page.wait_for_timeout(150)
+    await page.keyboard.press(f"{_MOD_KEY}+a")
+    await page.wait_for_timeout(150)
+    await page.keyboard.press("Delete")
+    await page.wait_for_timeout(200)
+
+    await page.evaluate(
+        """(content) => {
+            const editor = document.querySelector('.ProseMirror');
+            if (!editor) return;
+            editor.focus();
+            const dt = new DataTransfer();
+            dt.setData('text/plain', content);
+            const pasteEvt = new ClipboardEvent('paste', {
+                clipboardData: dt,
+                bubbles: true,
+                cancelable: true,
+            });
+            editor.dispatchEvent(pasteEvt);
+            editor.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertFromPaste',
+                data: content,
+            }));
+            editor.dispatchEvent(new Event('change', { bubbles: true }));
+            editor.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Process' }));
+        }""",
+        plain_content,
     )
     # 轮询等待正文写入完成（最多 5 秒）
     wc = 0
@@ -637,7 +746,7 @@ async def inspect_editor_prefill(page) -> dict:
 
 
 async def _settle_editor_before_publish(page):
-    """让编辑器失焦，给平台一点时间完成内部状态同步。"""
+    """让编辑器失焦，给平台一点时间完成内部状态同步和自动保存。"""
     try:
         await page.evaluate("""() => {
             const active = document.activeElement;
@@ -652,7 +761,60 @@ async def _settle_editor_before_publish(page):
         }""")
     except Exception:
         pass
-    await page.wait_for_timeout(300)
+    for _ in range(12):
+        state = await page.evaluate("""() => {
+            const text = document.body.innerText || '';
+            return {
+                saving: /保存中|正在保存|同步中|提交中/.test(text),
+                saved: /已保存|保存成功/.test(text),
+            };
+        }""")
+        if not state.get("saving"):
+            break
+        await page.wait_for_timeout(500)
+    await page.wait_for_timeout(500)
+
+
+async def _get_editor_submit_debug_state(page) -> dict:
+    """采集“下一步”禁用时的编辑器状态，便于定位平台校验卡点。"""
+    try:
+        return await page.evaluate("""() => {
+            const norm = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const titleInput = document.querySelector('input[placeholder="请输入标题"]');
+            const inputs = Array.from(document.querySelectorAll('input'))
+                .filter(visible)
+                .map((el) => ({
+                    placeholder: el.getAttribute('placeholder') || '',
+                    value: el.value || '',
+                    type: el.type || '',
+                }))
+                .slice(0, 8);
+            const editor = document.querySelector('.ProseMirror');
+            const next = Array.from(document.querySelectorAll('button.auto-editor-next, button, [role="button"]'))
+                .filter((el) => visible(el) && norm(el.innerText || el.textContent || '').includes('下一步'))[0] || null;
+            const bodyText = norm(document.body.innerText || '');
+            const saveMatch = bodyText.match(/(保存中|正在保存|已保存|保存成功|未保存|同步中)/);
+            return {
+                title: titleInput ? titleInput.value || '' : '',
+                inputs,
+                editorLength: editor ? norm(editor.innerText || '').length : 0,
+                saveText: saveMatch ? saveMatch[1] : '',
+                nextText: next ? norm(next.innerText || next.textContent || '') : '',
+                nextDisabled: next ? !!next.disabled : null,
+                nextAriaDisabled: next ? next.getAttribute('aria-disabled') || '' : '',
+                nextClass: next ? String(next.className || '') : '',
+                nextTitle: next ? next.getAttribute('title') || '' : '',
+            };
+        }""")
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def _get_next_step_button_state(page) -> dict:
@@ -677,7 +839,8 @@ async def _get_next_step_button_state(page) -> dict:
                     && !el.classList.contains('disabled')) ? 100000 : 0;
                 return primary + enabled + Math.round(rect.bottom * 10) + Math.round(rect.width * rect.height);
             };
-            const best = candidates.slice().sort((a, b) => pickScore(b) - pickScore(a))[0] || null;
+            const ranked = candidates.slice().sort((a, b) => pickScore(b) - pickScore(a));
+            const best = ranked[0] || null;
             const hints = Array.from(document.querySelectorAll(
                 '.arco-form-item-message, .arco-form-item-explain, .byte-form-item-message, .byte-form-item-explain, [class*="error"], [class*="warning"]'
             ))
@@ -695,11 +858,58 @@ async def _get_next_step_button_state(page) -> dict:
                     || best.classList.contains('disabled')
                 ),
                 className: best ? (best.className || '') : '',
+                rankedTexts: ranked.slice(0, 5).map((el) => norm(el.innerText || el.textContent || '')),
                 hints,
             };
         }""")
     except Exception as e:
         return {"found": False, "error": str(e), "hints": []}
+
+
+async def _click_best_next_step_button(page, *, force: bool = False) -> bool:
+    """只点击当前评分最高的“下一步”按钮，避免误点其他同名按钮。"""
+    try:
+        return bool(await page.evaluate("""(forceClick) => {
+            const norm = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const candidates = Array.from(document.querySelectorAll('button.auto-editor-next, button, [role="button"]'))
+                .filter((el) => visible(el) && norm(el.innerText || el.textContent || '').includes('下一步'));
+            const pickScore = (el) => {
+                const rect = el.getBoundingClientRect();
+                const primary = (el.className || '').includes('auto-editor-next') ? 1000000 : 0;
+                const enabled = (!el.disabled
+                    && el.getAttribute('aria-disabled') !== 'true'
+                    && !el.classList.contains('disabled')) ? 100000 : 0;
+                return primary + enabled + Math.round(rect.bottom * 10) + Math.round(rect.width * rect.height);
+            };
+            const btn = candidates.slice().sort((a, b) => pickScore(b) - pickScore(a))[0] || null;
+            if (!btn) return false;
+            btn.scrollIntoView({ block: 'center', inline: 'center' });
+            if (!forceClick && (
+                btn.disabled
+                || btn.getAttribute('aria-disabled') === 'true'
+                || btn.classList.contains('disabled')
+            )) {
+                return false;
+            }
+            if (typeof btn.click === 'function') {
+                btn.click();
+                return true;
+            }
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            });
+            return true;
+        }""", force))
+    except Exception as e:
+        logger.debug(f"JS点击主“下一步”失败(force={force}): {e}")
+        return False
 
 
 def _format_publish_flow_state(state: dict) -> str:
@@ -723,6 +933,8 @@ def _format_publish_flow_state(state: dict) -> str:
         flags.append("submit")
     if state.get("hasRiskDialog"):
         flags.append("risk")
+    if state.get("hasDetectionChoice"):
+        flags.append("detect")
     if state.get("hasIgnoreAll"):
         flags.append("ignore")
     if flags:
@@ -750,6 +962,7 @@ def _is_same_publish_flow_state(a: dict | None, b: dict | None) -> bool:
         "hasContinueEdit",
         "hasSubmitConfirm",
         "hasRiskDialog",
+        "hasDetectionChoice",
         "hasIgnoreAll",
     )
     if any(a.get(k) != b.get(k) for k in keys):
@@ -811,10 +1024,14 @@ async def get_publish_flow_state(page) -> dict:
                     || visibleButtons.some((t) => ['确认发布', '定时发布'].includes(t)),
                 hasContinueEdit: bodyText.includes('是否继续编辑'),
                 hasSubmitConfirm: bodyText.includes('是否确定提交') || bodyText.includes('发布提示'),
-                hasRiskDialog: bodyText.includes('是否进行内容风险检测'),
+                hasRiskDialog: bodyText.includes('是否进行内容风险检测')
+                    || bodyText.includes('请选择内容检测方式'),
+                hasDetectionChoice: bodyText.includes('请选择内容检测方式')
+                    || (bodyText.includes('仅基础检测') && bodyText.includes('全面检测')),
                 hasIgnoreAll: visibleButtons.some((t) => ['忽略全部', '全部忽略', '暂不处理', '关闭', '我知道了', '知道了'].includes(t)),
                 dialogTitles: takeTexts('[role="dialog"] h1, [role="dialog"] h2, [role="dialog"] h3, .arco-modal-title, .semi-modal-title, .semi-drawer-title', 6),
                 sidePanelTexts: takeTexts('[class*="drawer"], [class*="panel"], [class*="modal"], [class*="dialog"]', 6),
+                bodyText: norm(bodyText),
                 visibleButtons,
             };
         }""")
@@ -1293,6 +1510,9 @@ async def click_next_step(page):
         logger.info(
             f"  检测到多个“下一步”按钮，优先点击主按钮: count={next_state.get('totalMatches')}"
         )
+        ranked_texts = next_state.get("rankedTexts") or []
+        if ranked_texts:
+            logger.info(f"  下一步候选按钮: {' | '.join(ranked_texts)}")
     if next_state.get("found") and next_state.get("disabled"):
         logger.info("  “下一步”当前不可点击，等待编辑器状态稳定")
         for _ in range(10):
@@ -1306,26 +1526,42 @@ async def click_next_step(page):
             if hints:
                 logger.warning(f"  “下一步”仍不可点击，页面提示: {hints}")
             else:
-                logger.warning("  “下一步”仍不可点击，未发现明显表单提示")
-    if await _click_visible_action(page, ["下一步"], wait_ms=400):
-        async def _wait_after_click() -> bool:
-            for _ in range(12):
-                await page.wait_for_timeout(400)
-                cur_state = await get_publish_flow_state(page)
-                if cur_state.get("hasPublishSettings"):
-                    return True
-                if (
-                    cur_state.get("hasContinueEdit")
-                    or cur_state.get("hasSubmitConfirm")
-                    or cur_state.get("hasRiskDialog")
-                    or cur_state.get("hasIgnoreAll")
-                ):
-                    return True
-                if not _is_same_publish_flow_state(before_state, cur_state):
-                    return True
-            return False
-        if await _wait_after_click():
-            return
+                debug_state = await _get_editor_submit_debug_state(page)
+                inputs = debug_state.get("inputs") or []
+                input_preview = " | ".join(
+                    f"{str(i.get('placeholder') or i.get('type') or 'input')[:12]}={str(i.get('value') or '')[:20]}"
+                    for i in inputs[:5]
+                )
+                logger.warning(
+                    "  “下一步”仍不可点击，未发现明显表单提示"
+                    f" | title={str(debug_state.get('title') or '')[:30]}"
+                    f" | editorLen={debug_state.get('editorLength')}"
+                    f" | save={debug_state.get('saveText') or '-'}"
+                    f" | nextDisabled={debug_state.get('nextDisabled')}"
+                    f" | aria={debug_state.get('nextAriaDisabled') or '-'}"
+                    f" | class={str(debug_state.get('nextClass') or '')[:60]}"
+                    f" | inputs={input_preview}"
+                )
+    async def _wait_after_click() -> bool:
+        for _ in range(12):
+            await page.wait_for_timeout(400)
+            cur_state = await get_publish_flow_state(page)
+            if cur_state.get("hasPublishSettings"):
+                return True
+            if (
+                cur_state.get("hasContinueEdit")
+                or cur_state.get("hasSubmitConfirm")
+                or cur_state.get("hasRiskDialog")
+                or cur_state.get("hasDetectionChoice")
+                or cur_state.get("hasIgnoreAll")
+            ):
+                return True
+            if not _is_same_publish_flow_state(before_state, cur_state):
+                return True
+        return False
+
+    if await _click_best_next_step_button(page) and await _wait_after_click():
+        return
 
     next_btn = page.locator("button.auto-editor-next")
     if await next_btn.count() == 0:
@@ -1343,6 +1579,7 @@ async def click_next_step(page):
                 cur_state.get("hasContinueEdit")
                 or cur_state.get("hasSubmitConfirm")
                 or cur_state.get("hasRiskDialog")
+                or cur_state.get("hasDetectionChoice")
                 or cur_state.get("hasIgnoreAll")
             ):
                 return True
@@ -1436,6 +1673,17 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
             await _apply_publish_options(page, use_ai=use_ai)
             return
 
+        handled_dialog = await _handle_publish_interruption_dialogs(page)
+        if handled_dialog:
+            logger.info(f"  检测到发布流程弹窗，点击: {handled_dialog}")
+            await page.wait_for_timeout(1000)
+            if handled_dialog == "继续编辑":
+                await click_next_step(page)
+                await page.wait_for_timeout(1200)
+            stagnant_editor_rounds = 0
+            last_state = None
+            continue
+
         try:
             ignore_labels = ("忽略全部", "全部忽略", "暂不处理", "关闭", "我知道了", "知道了")
             handled_ignore = False
@@ -1462,6 +1710,11 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
                 await page.wait_for_timeout(1000)
                 continue
 
+        if await page.locator("text=请选择内容检测方式").count() > 0:
+            if await _click_visible_action(page, ["仅基础检测", "基础检测"]):
+                await page.wait_for_timeout(1000)
+                continue
+
         is_editor_still_waiting = (
             state.get("editorVisible")
             and state.get("hasNextStep")
@@ -1469,6 +1722,7 @@ async def _navigate_to_publish_settings(page, *, use_ai: bool = False):
             and not state.get("hasContinueEdit")
             and not state.get("hasSubmitConfirm")
             and not state.get("hasRiskDialog")
+            and not state.get("hasDetectionChoice")
             and not state.get("hasIgnoreAll")
         )
         if is_editor_still_waiting:
@@ -1776,7 +2030,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
         # 先验证登录态：打开新建章节页看是否能进入编辑器
         await page.goto(new_chapter_url)
         try:
-            await wait_for_editor_ready(page, prefer_continue_edit=False)
+            await wait_for_editor_ready(page, prefer_continue_edit=True)
         except PWTimeout:
             logger.error("无法进入编辑器，请检查:")
             logger.info("  1. Book ID 是否正确")
@@ -1804,7 +2058,7 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
                     # 首章首次复用当前页面，其余情况导航到新建 URL
                     if i > 0 or attempt > 1:
                         await page.goto(new_chapter_url)
-                        await wait_for_editor_ready(page, prefer_continue_edit=False)
+                        await wait_for_editor_ready(page, prefer_continue_edit=True)
 
                     if target_volume:
                         await select_editor_volume(page, target_volume)
@@ -1881,13 +2135,17 @@ async def cmd_upload(directory: Path, book_id: str, publish: bool, args):
 # ---------------------------------------------------------------------------
 async def edit_one_chapter(
     page, book_id: str, platform_ch: dict, ch_num: int, title: str, content: str,
-    *, use_ai: bool = False, max_retries: int = 2,
+    *, use_ai: bool = False, max_retries: int = 2, cancel_check=None,
 ) -> bool:
     """编辑单个已有章节（含重试）。成功返回 True，失败返回 False。
 
     DailyLimitReached 不在此处捕获，直接向上抛出以停止整个循环。
+    cancel_check 返回 True 时立即中止，避免 GUI 点击“停止”后仍继续重试。
     """
     for attempt in range(1, max_retries + 2):
+        if cancel_check and cancel_check():
+            logger.info("用户取消修改。")
+            return False
         try:
             edit_url = str(platform_ch.get("editUrl", "") or "").strip()
             if edit_url.startswith("/"):

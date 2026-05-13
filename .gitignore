@@ -25,6 +25,7 @@ fanqie_error.log.*
 # IDE
 .idea/
 .vscode/
+.claude/
 *.code-workspace
 .omx/
 

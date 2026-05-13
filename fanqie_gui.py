@@ -803,7 +803,7 @@ class FanqieGUI:
         self.ent_resched_filter_num.pack(side="left", padx=2)
         ttk.Label(
             self._resched_filter_row,
-            text="支持 5 / 5-10 / 1,5,8-10",
+            text="单数字配合≤/≥；精确单章用 5-5；也支持 5-10 / 1,5,8-10",
             foreground="gray",
         ).pack(side="left", padx=(4, 0))
         ttk.Button(
@@ -864,10 +864,23 @@ class FanqieGUI:
         ttk.Button(selector_bar, text="清空", command=self._chapter_selector_clear).pack(side="right")
         ttk.Button(selector_bar, text="奇数章", command=self._chapter_selector_select_odd).pack(side="right", padx=(6, 0))
         ttk.Button(selector_bar, text="偶数章", command=self._chapter_selector_select_even).pack(side="right", padx=(6, 0))
-        ttk.Label(selector_bar, text="最近").pack(side="right", padx=(6, 2))
+        ttk.Button(selector_bar, text="只选当前章", command=self._chapter_selector_select_current_only).pack(side="right", padx=(6, 0))
+        recent_frame = ttk.Frame(selector_bar)
+        recent_frame.pack(side="right", padx=(6, 0))
+        ttk.Label(recent_frame, text="最近").pack(side="left", padx=(0, 2))
         self.chapter_recent_count_var = tk.StringVar(value="5")
-        ttk.Entry(selector_bar, textvariable=self.chapter_recent_count_var, width=4).pack(side="right")
-        ttk.Button(selector_bar, text="章", command=self._chapter_selector_select_recent).pack(side="right", padx=(2, 0))
+        self.ent_chapter_recent_count = ttk.Entry(
+            recent_frame, textvariable=self.chapter_recent_count_var, width=4
+        )
+        self.ent_chapter_recent_count.pack(side="left")
+        ttk.Label(recent_frame, text="章").pack(side="left", padx=(2, 2))
+        self.ent_chapter_recent_count.bind(
+            "<Return>", lambda _e: self._chapter_selector_select_recent()
+        )
+        self.ent_chapter_recent_count.bind(
+            "<FocusOut>", lambda _e: self._chapter_selector_select_recent(silent=True)
+        )
+        ttk.Button(recent_frame, text="应用", command=self._chapter_selector_select_recent).pack(side="left")
         selector_list_frame = ttk.Frame(selector_frame)
         selector_list_frame.pack(fill="x", padx=4, pady=(0, 4))
         self.lst_chapter_selector = tk.Listbox(
@@ -879,6 +892,7 @@ class FanqieGUI:
         )
         self.lst_chapter_selector.pack(side="left", fill="x", expand=True)
         self.lst_chapter_selector.bind("<<ListboxSelect>>", lambda _e: self._on_chapter_selector_changed())
+        self.lst_chapter_selector.bind("<Double-Button-1>", lambda _e: self._chapter_selector_select_current_only())
         selector_scroll = ttk.Scrollbar(
             selector_list_frame,
             orient="vertical",
@@ -1196,9 +1210,14 @@ class FanqieGUI:
     def _refresh_chapter_selector_panel(self):
         items = self._get_chapter_picker_items()
         self._chapter_selector_items = items
-        self.lst_chapter_selector.delete(0, tk.END)
-        for _, label in items:
-            self.lst_chapter_selector.insert(tk.END, label)
+        was_syncing = self._chapter_selector_syncing
+        self._chapter_selector_syncing = True
+        try:
+            self.lst_chapter_selector.delete(0, tk.END)
+            for _, label in items:
+                self.lst_chapter_selector.insert(tk.END, label)
+        finally:
+            self._chapter_selector_syncing = was_syncing
         self._sync_chapter_selector_from_filter()
 
     def _chapter_selector_get_selected_nums(self) -> list[int]:
@@ -1213,7 +1232,14 @@ class FanqieGUI:
         self._chapter_selector_syncing = True
         try:
             self.resched_filter_var.set(bool(nums))
-            self.resched_filter_num_var.set(",".join(str(n) for n in nums) if nums else "")
+            if not nums:
+                expr = ""
+            elif len(nums) == 1:
+                # 单数字会受“≤/≥”影响；快捷选择需要精确单章，所以写成闭区间。
+                expr = f"{nums[0]}-{nums[0]}"
+            else:
+                expr = ",".join(str(n) for n in nums)
+            self.resched_filter_num_var.set(expr)
         finally:
             self._chapter_selector_syncing = False
         self._set_chapter_selector_nums(nums)
@@ -1240,16 +1266,38 @@ class FanqieGUI:
             num for num, _ in self._chapter_selector_items if int(num) % 2 == 0
         )
 
-    def _chapter_selector_select_recent(self):
+    def _chapter_selector_current_num(self):
+        if not self._chapter_selector_items:
+            return None
+        selected = list(self.lst_chapter_selector.curselection())
+        idx = selected[-1] if selected else self.lst_chapter_selector.index(tk.ACTIVE)
+        if idx is None or idx < 0 or idx >= len(self._chapter_selector_items):
+            return None
+        return int(self._chapter_selector_items[idx][0])
+
+    def _chapter_selector_select_current_only(self):
+        num = self._chapter_selector_current_num()
+        if num is None:
+            messagebox.showwarning("提示", "请先在章节列表里点中一章。")
+            return
+        self._chapter_selector_apply_nums([num])
+
+    def _chapter_selector_select_recent(self, *, silent: bool = False):
         try:
             recent_count = int(str(self.chapter_recent_count_var.get()).strip() or "0")
         except ValueError:
-            messagebox.showwarning("提示", "最近章节数量请输入数字。")
+            if not silent:
+                messagebox.showwarning("提示", "最近章节数量请输入数字。")
             return
         if recent_count <= 0:
-            messagebox.showwarning("提示", "最近章节数量需大于 0。")
+            if not silent:
+                messagebox.showwarning("提示", "最近章节数量需大于 0。")
             return
         nums = [int(num) for num, _ in self._chapter_selector_items]
+        if not nums:
+            if not silent:
+                messagebox.showwarning("提示", "当前没有可选择的章节。")
+            return
         self._chapter_selector_apply_nums(nums[-recent_count:])
 
     def _export_log(self):
@@ -2511,21 +2559,45 @@ class FanqieGUI:
         def _clear_all():
             lb.selection_clear(0, tk.END)
 
-        def _confirm():
+        def _current_num():
             selected_idx = list(lb.curselection())
-            if not selected_idx:
+            idx = selected_idx[-1] if selected_idx else lb.index(tk.ACTIVE)
+            if idx is None or idx < 0 or idx >= len(nums):
+                return None
+            return nums[idx]
+
+        def _apply_selected(selected_nums):
+            selected_nums = sorted({int(n) for n in selected_nums})
+            if not selected_nums:
                 messagebox.showwarning("提示", "请至少选择一个章节。", parent=win)
                 return
-            selected_nums = sorted({nums[i] for i in selected_idx})
+            if len(selected_nums) == 1:
+                expr = f"{selected_nums[0]}-{selected_nums[0]}"
+            else:
+                expr = ",".join(str(n) for n in selected_nums)
             self.resched_filter_var.set(True)
-            self.resched_filter_num_var.set(",".join(str(n) for n in selected_nums))
+            self.resched_filter_num_var.set(expr)
             self._refresh_preview()
             win.destroy()
+
+        def _confirm_current():
+            num = _current_num()
+            if num is None:
+                messagebox.showwarning("提示", "请先点中一章。", parent=win)
+                return
+            _apply_selected([num])
+
+        def _confirm():
+            selected_idx = list(lb.curselection())
+            _apply_selected(nums[i] for i in selected_idx)
+
+        lb.bind("<Double-Button-1>", lambda _e: _confirm_current())
 
         ttk.Button(btns, text="全选", command=_select_all).pack(side="left")
         ttk.Button(btns, text="清空", command=_clear_all).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side="right")
         ttk.Button(btns, text="确定", command=_confirm, style="Accent.TButton").pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text="确定单章", command=_confirm_current).pack(side="right", padx=(0, 6))
 
     def _refresh_reschedule_preview(self):
         """修改排期模式预览: 显示平台章节 + 计算的新排期。"""
@@ -2720,7 +2792,7 @@ class FanqieGUI:
 
                     await page.goto(url)
                     try:
-                        await wait_for_editor_ready(page, prefer_continue_edit=False)
+                        await wait_for_editor_ready(page, prefer_continue_edit=True)
                     except PWTimeout:
                         logger.error("无法进入编辑器，请检查 Book ID 和登录状态。")
                         await browser.close()
@@ -2748,11 +2820,16 @@ class FanqieGUI:
 
                         ok = False
                         daily_limit = False
+                        cancelled = False
                         for attempt in range(1, max_retries + 2):
+                            if self._cancel_requested:
+                                logger.info("用户取消上传。")
+                                cancelled = True
+                                break
                             try:
                                 if i > 0 or attempt > 1:
                                     await page.goto(url)
-                                    await wait_for_editor_ready(page, prefer_continue_edit=False)
+                                    await wait_for_editor_ready(page, prefer_continue_edit=True)
 
                                 if target_volume:
                                     await select_editor_volume(page, target_volume)
@@ -2799,6 +2876,9 @@ class FanqieGUI:
                                     except Exception:
                                         pass
 
+                        if cancelled:
+                            break
+
                         if daily_limit:
                             failed += 1
                             break
@@ -2843,6 +2923,7 @@ class FanqieGUI:
     def _upload_done(self, success, failed):
         self._remove_log_handler()
         self._set_uploading(False)
+        mode = self.mode_var.get()
         # 上传完成: 清除章节/发布缓存，卷结构不变无需清除
         self._invalidate_caches("chapters")
 
@@ -2854,6 +2935,11 @@ class FanqieGUI:
                 shutil.copy2(str(AUTH_FILE), str(named))
             except Exception:
                 pass
+
+        if mode in ("edit", "reschedule"):
+            self.btn_upload.configure(state="disabled")
+            self._fetch_gen += 1
+            self._fetch_platform_chapters_for_edit()
 
         if success >= 0:
             messagebox.showinfo("操作完成", f"成功 {success} 章，失败 {failed} 章")
@@ -2906,7 +2992,8 @@ class FanqieGUI:
                             if await edit_one_chapter(
                                     page, book_id, plat_ch, ch_num, title, content,
                                     use_ai=use_ai,
-                                    max_retries=self._cfg.get("max_retries", 2)):
+                                    max_retries=self._cfg.get("max_retries", 2),
+                                    cancel_check=lambda: self._cancel_requested):
                                 success += 1
                             else:
                                 failed += 1

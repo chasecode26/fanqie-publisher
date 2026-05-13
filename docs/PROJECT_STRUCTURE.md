@@ -1,46 +1,49 @@
-# 项目结构说明
+# 项目结构
 
-本项目保持“单仓库、双入口（GUI + CLI）”的轻量结构，核心纯逻辑下沉到 `fanqie_core/`，
-避免 `fanqie_upload.py` 持续膨胀为超大单文件。
+这个项目保留两个入口：图形界面给日常使用，命令行给批处理或临时排查使用。
 
-## 核心文件
+```text
+fanqie-publisher/
+├─ fanqie_gui.py          # 图形界面入口
+├─ fanqie_upload.py       # 命令行入口和发布流程编排
+├─ fanqie_core/           # 不依赖浏览器的纯逻辑
+├─ fanqie_web/            # 浏览器页面操作和 JS 片段
+├─ docs/                  # 使用说明和排查文档
+├─ chapters/              # 默认章节目录，本地使用
+├─ run.bat                # Windows 启动脚本
+├─ run.sh                 # macOS / Linux 启动脚本
+├─ requirements.txt       # Python 依赖
+└─ config.json            # 本地配置
+```
 
-- `fanqie_upload.py`
-  - 核心业务逻辑（上传、发布、定时、编辑、排期）
-  - CLI 入口
-- `fanqie_gui.py`
-  - Tkinter GUI 入口
-  - 调用 `fanqie_upload.py` 的核心能力
-- `fanqie_core/`
-  - `daily_limit.py`：当日字数上限识别策略
-  - `chapter_match.py`：本地章节与平台章节匹配策略
-  - `schedule_rules.py`：排期计算与时间解析策略
-  - `volume_rules.py`：分卷解析与按章节号选卷规则
-  - `chapter_text.py`????/?????Markdown ??????????
-  - 仅包含纯逻辑，便于单元测试与复用
-- `fanqie_web/`
-  - `js_snippets.py`??? evaluate ?? JS ???????/?????
-  - `volume_ops.py`?????/?????????
-  - `manage_ops.py`????????/????/????????
-  - `__init__.py`?????
+## 主要模块
 
-## 运行与配置
+- `fanqie_gui.py`：负责界面、预览、章节筛选、任务启动和日志展示。
+- `fanqie_upload.py`：负责登录、上传、保存草稿、发布、修改正文、修改排期。
+- `fanqie_core/chapter_text.py`：章节标题、章节号和正文清洗。
+- `fanqie_core/chapter_match.py`：本地章节和平台章节匹配。
+- `fanqie_core/schedule_rules.py`：定时发布排期计算。
+- `fanqie_core/volume_rules.py`：分卷名称解析和自动切卷规则。
+- `fanqie_core/daily_limit.py`：平台当日发布上限识别。
+- `fanqie_web/js_snippets.py`：页面内执行的 JS 片段。
+- `fanqie_web/volume_ops.py`：章节管理页和编辑器里的分卷选择。
+- `fanqie_web/manage_ops.py`：章节管理页翻页、定位章节和修改排期。
 
-- `config.json`：本地工作流配置
-- `chapters/`：章节输入目录
-- `.auth_state.json` / `.auth_*.json`：登录态
-- `fanqie_error.log`：运行日志
+## 本地运行文件
 
-## 质量保障
+以下文件是运行时产生或保存的个人配置，不建议提交：
 
-- `tests/test_volume_resolution.py`：分卷解析回归测试
-- `tests/test_daily_limit_detection.py`：当日字数上限识别测试
-- `tests/test_core_modules.py`：核心模块（匹配/排期/分卷/上限）回归测试
-- `tests/test_chapter_text.py`?????????????
-- `tests/test_manage_ops.py`????????????????
+- `.auth_*.json`
+- `.auth_state.json`
+- `.gui_state.json`
+- `config.json`
+- `fanqie_error.log`
+- `chapters/`
+- `__pycache__/`
 
-## 结构优化原则
+## 整理原则
 
-1. 不破坏现有用户路径（尤其是 `config.json`、认证文件、`run.bat`）。
-2. 纯逻辑优先放在 `fanqie_core/`，`fanqie_upload.py` 负责流程编排，GUI 只做调用与展示。
-3. 每次功能修复都补充最小回归测试。
+1. 登录态、配置和章节目录优先保留。
+2. 缓存、运行日志、临时截图可以随时删除。
+3. 新功能优先放到现有模块中，只有明显变大或复用价值高时再拆新文件。
+

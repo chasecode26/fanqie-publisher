@@ -1,159 +1,115 @@
-# fanqie-publisher
+# 番茄发布助手
 
-一个面向番茄作者日常连载发布的 Python 工具（GUI + CLI）。
+一个给番茄小说作者日常连载使用的发布工具。它提供图形界面和命令行两种入口，重点解决重复上传、定时发布、立即发布、修改正文、修改排期和分卷选择这些高频操作。
 
-> 本仓库在上游项目基础上做了工作流增强，重点优化了：
-> - 新建章节分卷（默认卷 / 规则卷 / 手动卷）
-> - 立即发布 / 定时发布流程稳定性
-> - 修改已有章节与排期的批处理能力
-> - 当日字数上限命中后的自动停止与提示
+## 能做什么
 
----
+- 批量读取本地 `.md` / `.txt` 章节文件。
+- 新建章节并存草稿、立即发布或定时发布。
+- 修改已有章节正文并重新提交。
+- 批量修改待发布章节的发布时间。
+- 按章节号筛选，只处理指定章节、范围或离散章节。
+- 选择已有分卷，支持默认分卷和按章节号自动切卷。
+- 自动处理发布流程中的常见弹窗，例如继续编辑、发布确认、基础检测选择。
+- 命中平台当日发布字数上限时停止后续任务，避免无意义重试。
 
-## 1. 功能概览
+> 分卷功能只负责选择平台上已有的卷，不会自动创建新卷。需要新卷时，请先在番茄后台建好。
 
-- 登录态保存与复用
-- 批量读取 `chapters/` 下 `.md/.txt`
-- 三种新建模式：
-  - 存草稿
-  - 立即发布
-  - 定时发布
-- 修改模式：
-  - 修改内容并发布
-  - 修改排期
-- 分卷策略：
-  - 手动指定
-  - 默认分卷
-  - 按章节号规则自动切卷
-- 自动重试与错误截图
-- 日志输出到 `fanqie_error.log`
+## 快速使用
 
----
+### 1. 安装环境
 
-## 2. 项目结构（已优化）
-
-```text
-fanqie-publisher/
-?? fanqie_gui.py                 # GUI ??
-?? fanqie_upload.py              # ????? CLI ??
-?? fanqie_core/                  # ??????????
-?  ?? daily_limit.py             # ????????
-?  ?? chapter_match.py           # ??????
-?  ?? schedule_rules.py          # ??????
-?  ?? volume_rules.py            # ?????????
-?  ?? chapter_text.py            # ?????????
-?  ?? __init__.py
-?? fanqie_web/                   # ????? JS ??
-?  ?? js_snippets.py
-?  ?? volume_ops.py
-?  ?? manage_ops.py
-?  ?? __init__.py
-?? run.bat                       # Windows ??
-?? run.sh                        # Linux/macOS ??
-?? requirements.txt
-?? config.json                   # ???????? .gitignore ???
-?? chapters/                     # ???????? .gitignore ???
-?? tests/                        # ????
-?  ?? test_volume_resolution.py
-?  ?? test_daily_limit_detection.py
-?  ?? test_core_modules.py
-?  ?? test_chapter_text.py
-?  ?? test_manage_ops.py
-?? docs/
-   ?? PROJECT_STRUCTURE.md       # ????
-   ?? TROUBLESHOOTING.md         # ??????
-```
-
----
-
-## 3. 快速开始
-
-### 3.1 环境
-
-- Python 3.10+
-- Playwright Chromium
-
-安装：
+需要 Python 3.10+。
 
 ```bash
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-### 3.2 启动 GUI
+### 2. 启动图形界面
 
-```bash
-python fanqie_gui.py
-```
-
-Windows 也可直接双击：
+Windows 可双击：
 
 ```bash
 run.bat
 ```
 
-### 3.3 CLI 示例
+也可以手动运行：
 
 ```bash
-# 登录并保存会话
+python fanqie_gui.py
+```
+
+### 3. 首次登录
+
+在界面里点击登录，或使用命令行：
+
+```bash
+python fanqie_upload.py login
+```
+
+登录态会保存在本地 `.auth_*.json` 文件中。不要把这些文件发给别人。
+
+## 图形界面使用建议
+
+1. 先刷新作品列表，选择目标作品。
+2. 选择章节文件夹。
+3. 选择操作模式：存草稿、立即发布、定时发布、修改内容或修改排期。
+4. 在章节预览区确认顺序、字数、分卷和筛选结果。
+5. 只处理单章时，点中章节后使用“只选当前章”；也可以输入章节号筛选。
+6. 点击开始上传，等待日志显示完成结果。
+
+## 章节筛选格式
+
+章节号筛选支持：
+
+- `36`：只处理第 36 章。
+- `31-36`：处理第 31 到 36 章。
+- `31,33,36`：处理指定几章。
+- `31,35-38`：混合选择。
+
+预览区里的快捷按钮会自动同步到筛选框。
+
+## 分卷规则
+
+分卷设置适用于新建章节：
+
+- `新建章节默认分卷`：所有新建章节默认选择这个已有分卷。
+- `规则：第 N 章及以后 -> 某分卷`：达到指定章节号后自动切到目标分卷。
+- 操作模式下方的 `新建章节分卷`：本次手动指定分卷，优先级最高。
+
+如果目标分卷不存在，程序不会创建新卷，只会记录无法选择分卷。
+
+## 命令行示例
+
+```bash
+# 登录
 python fanqie_upload.py login
 
-# 列出作品
+# 查看作品
 python fanqie_upload.py books
 
-# 批量上传为草稿
+# 上传为草稿
 python fanqie_upload.py upload ./chapters --book-id <BOOK_ID>
 
 # 立即发布
 python fanqie_upload.py upload ./chapters --book-id <BOOK_ID> --publish
 
-# 定时发布（示例：每天 3 章）
-python fanqie_upload.py upload ./chapters --book-id <BOOK_ID> --schedule 2026-04-08 --per-day 3
+# 定时发布
+python fanqie_upload.py upload ./chapters --book-id <BOOK_ID> --schedule 2026-05-14 --time 08:00,12:00 --per-day 2
 ```
 
----
+## 本地文件说明
 
-## 4. 关键配置
+- `config.json`：本地配置，会记录默认作品、默认模式、章节目录和分卷规则。
+- `.gui_state.json`：界面状态。
+- `.auth_*.json`：登录态。
+- `chapters/`：默认章节目录。
+- `fanqie_error.log`：运行时日志，出问题时可查看；不需要时可以删除。
 
-`config.json` 常用字段：
+这些本地文件默认不会提交到 Git。
 
-- `preferred_book_id`：默认作品 ID
-- `chapters_dir`：默认章节目录
-- `default_mode`：默认模式（draft/publish/schedule/edit/reschedule）
-- `default_time`：默认发布时间，可逗号分隔多个时间点
-- `default_new_chapter_volume`：新建章节默认分卷（支持 `"1"` 这类写法）
-- `new_chapter_volume_rules`：按章节号切卷规则
-- `max_retries`：非平台限制错误时的重试次数
+## 问题排查
 
----
+常见问题见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
-## 5. 稳定性说明（重要）
-
-- 发布流程已做“下一步 / 发布设置 / 确认发布”多重兜底。
-- 当命中番茄**当日发布字数上限**时：
-  - 会给出明确提示
-  - 会停止后续章节处理
-  - 不会继续重试
-
----
-
-## 6. 开发与验证
-
-语法检查：
-
-```bash
-python -m py_compile fanqie_upload.py fanqie_gui.py fanqie_core/__init__.py fanqie_core/daily_limit.py fanqie_core/volume_rules.py fanqie_core/chapter_match.py fanqie_core/schedule_rules.py fanqie_core/chapter_text.py fanqie_web/__init__.py fanqie_web/js_snippets.py fanqie_web/volume_ops.py fanqie_web/manage_ops.py tests/test_volume_resolution.py tests/test_daily_limit_detection.py tests/test_core_modules.py tests/test_chapter_text.py tests/test_manage_ops.py
-```
-
-运行测试：
-
-```bash
-python -m unittest tests.test_volume_resolution tests.test_daily_limit_detection tests.test_core_modules tests.test_chapter_text tests.test_manage_ops
-```
-
----
-
-## 7. 致谢
-
-- 上游项目：`rockbenben/fanqie-publisher`
-- 本仓库面向个人连载工作流进行增强与维护
